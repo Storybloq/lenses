@@ -1,7 +1,8 @@
 {
   "blockedBy": [
     "T-003",
-    "T-008"
+    "T-008",
+    "T-020"
   ],
   "completedDate": null,
   "createdDate": "2026-04-13",
