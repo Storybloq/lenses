@@ -2,13 +2,14 @@
   "blockedBy": [
     "T-001"
   ],
-  "completedDate": null,
+  "claimedBySession": "7d9b114d-19ad-4adc-b0b5-8eb9464243e0",
+  "completedDate": "2026-04-13",
   "createdDate": "2026-04-13",
   "description": "Create src/server.ts using @modelcontextprotocol/sdk. Register two placeholder tools (lens_review_start, lens_review_complete) that return stub responses. Verify the server starts and responds to MCP handshake.",
   "id": "T-002",
   "order": 20,
   "phase": "foundation",
-  "status": "open",
+  "status": "complete",
   "title": "MCP server skeleton -- server.ts entry point with SDK",
   "type": "task"
 }

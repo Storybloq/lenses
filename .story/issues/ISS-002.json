@@ -1,0 +1,16 @@
+{
+  "components": [
+    "autonomous"
+  ],
+  "discoveredDate": "2026-04-13",
+  "id": "ISS-002",
+  "impact": "smoke test no longer exercises main()/StdioServerTransport bootstrap path; CLI wiring regressions would not be caught",
+  "location": [],
+  "phase": null,
+  "relatedTickets": [],
+  "resolution": null,
+  "resolvedDate": null,
+  "severity": "medium",
+  "status": "open",
+  "title": "[test coverage] smoke test no longer exercises main()/StdioServerTransport bootstrap path; CLI w"
+}
