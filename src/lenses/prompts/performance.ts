@@ -16,8 +16,17 @@ import { untrusted } from "./untrusted.js";
  * This is a LEXICAL sanity filter, not a semantic safety proof. `hotPaths`
  * values are ALSO wrapped in `<untrusted-context>` at render time -- the
  * wrapper is the real trust boundary.
+ *
+ * Exported so the T-006 activation-config schema can enforce the same
+ * grammar at the user-facing intake boundary -- single source of truth.
  */
-const GLOB_PATTERN_RE = /^[A-Za-z0-9._*?/{}[\]()@+:!|\\,-]+$/;
+export const PERFORMANCE_GLOB_RE = /^[A-Za-z0-9._*?/{}[\]()@+:!|\\,-]+$/;
+
+/** Max length of a single hotPath entry. Exported for T-006 reuse. */
+export const PERFORMANCE_HOTPATH_MAX = 200;
+
+/** Max number of hotPath entries. Exported for T-006 reuse. */
+export const PERFORMANCE_HOTPATHS_MAX = 50;
 
 export const PerformanceLensOptsSchema = z
   .object({
@@ -31,13 +40,13 @@ export const PerformanceLensOptsSchema = z
         z
           .string()
           .min(1)
-          .max(200)
+          .max(PERFORMANCE_HOTPATH_MAX)
           .regex(
-            GLOB_PATTERN_RE,
+            PERFORMANCE_GLOB_RE,
             "hotPath must be a glob pattern (no whitespace, quotes, or markup characters)",
           ),
       )
-      .max(50)
+      .max(PERFORMANCE_HOTPATHS_MAX)
       .optional(),
   })
   .strict();

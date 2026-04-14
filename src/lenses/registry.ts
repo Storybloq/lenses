@@ -1,0 +1,305 @@
+import path from "node:path";
+import { z } from "zod";
+
+import type { Stage } from "../schema/index.js";
+import { LENSES, type LensId } from "./prompts/index.js";
+import {
+  PERFORMANCE_GLOB_RE,
+  PERFORMANCE_HOTPATH_MAX,
+  PERFORMANCE_HOTPATHS_MAX,
+} from "./prompts/performance.js";
+
+/**
+ * Lens-id enum derived at compile time from the `LENSES` registry keys. Using
+ * `keyof typeof LENSES` as the enum tuple keeps the Zod schema in lockstep
+ * with the static registry -- adding a lens to LENSES without updating this
+ * file is impossible because `Object.keys(LENSES)` would drift from the type,
+ * caught by the `satisfies` constraint below.
+ */
+const LENS_IDS = Object.keys(LENSES) as [LensId, ...LensId[]];
+export const LensIdSchema = z.enum(LENS_IDS);
+
+export const ModelSchema = z.enum(["opus", "sonnet"]);
+export type Model = z.infer<typeof ModelSchema>;
+
+/**
+ * User-facing activation config -- the subset of `lensConfig` that determines
+ * which lenses fire and what opts each receives. Preamble-tuning knobs
+ * (findingBudget, confidenceFloor, tokenBudgetPerLens, lensTimeout) belong to
+ * T-007's preamble assembly, not here.
+ *
+ * `hotPaths` mirrors PerformanceLensOptsSchema byte-for-byte via the three
+ * re-exported constants so a malformed hotPath fails at this trust boundary,
+ * not deferred to `renderBody` at T-007 prompt-render time.
+ */
+export const LensConfigSchema = z
+  .object({
+    lenses: z
+      .union([z.literal("auto"), z.array(LensIdSchema).nonempty()])
+      .optional(),
+    maxLenses: z.number().int().min(1).max(8).optional(),
+    lensModels: z.record(LensIdSchema, ModelSchema).optional(),
+    hotPaths: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(PERFORMANCE_HOTPATH_MAX)
+          .regex(PERFORMANCE_GLOB_RE),
+      )
+      .max(PERFORMANCE_HOTPATHS_MAX)
+      .optional(),
+    scannerFindings: z.string().max(8192).optional(),
+  })
+  .strict();
+export type LensConfig = z.infer<typeof LensConfigSchema>;
+
+export interface LensActivation {
+  readonly lensId: LensId;
+  readonly model: Model;
+  readonly activationReason: string;
+  readonly opts: Record<string, unknown>;
+}
+
+/**
+ * File-surface predicate. All four fields are optional; a file matches when
+ * ANY predicate hits. Paths are normalized to forward slashes before check so
+ * `src\api\users.ts` on Windows still activates `/api/` rules.
+ */
+interface Surface {
+  readonly extensions?: readonly string[];
+  readonly pathSegments?: readonly string[];
+  readonly basenamePrefixes?: readonly string[];
+  readonly exactBasenames?: readonly string[];
+}
+
+type SurfaceRule = Surface | "core" | "test-quality-dual-mode";
+
+const SURFACE_RULES: Record<LensId, SurfaceRule> = {
+  security: "core",
+  "error-handling": "core",
+  "clean-code": "core",
+  concurrency: "core",
+  performance: {
+    extensions: [
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".mjs",
+      ".cjs",
+      ".py",
+      ".go",
+      ".rs",
+      ".java",
+      ".kt",
+      ".swift",
+      ".cs",
+      ".cpp",
+      ".c",
+      ".rb",
+      ".php",
+    ],
+  },
+  "api-design": {
+    extensions: [".graphql", ".gql", ".proto"],
+    pathSegments: [
+      "/api/",
+      "/routes/",
+      "/controllers/",
+      "/handlers/",
+      "/endpoints/",
+    ],
+    basenamePrefixes: ["openapi."],
+    exactBasenames: ["schema.ts", "schema.js", "schema.py"],
+  },
+  // test-quality has two activation modes (see findTestFile /
+  // findNonTestSourceFile) that can't be expressed with a plain Surface
+  // predicate -- the missing-coverage heuristic also sets
+  // opts.focusMissingCoverage=true. The sentinel makes the special-case
+  // branch in activate() explicit rather than a magic lensId comparison.
+  "test-quality": "test-quality-dual-mode",
+  accessibility: {
+    extensions: [
+      ".html",
+      ".vue",
+      ".svelte",
+      ".astro",
+      ".tsx",
+      ".jsx",
+      ".css",
+      ".scss",
+    ],
+  },
+};
+
+function normalize(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+/**
+ * Test-directory segment match that also hits root-level `test/helper.ts`
+ * (no leading slash). Without the prefix form a file at the repo root
+ * under `test/` would fall through to the source-file branch and get
+ * flagged with `focusMissingCoverage: true`, which is wrong.
+ */
+function inTestDir(f: string): boolean {
+  return (
+    f.includes("/test/") ||
+    f.includes("/tests/") ||
+    f.includes("/__tests__/") ||
+    f.startsWith("test/") ||
+    f.startsWith("tests/") ||
+    f.startsWith("__tests__/")
+  );
+}
+
+function matchesSurface(
+  changedFiles: readonly string[],
+  s: Surface,
+): string | null {
+  for (const raw of changedFiles) {
+    const f = normalize(raw);
+    const base = path.posix.basename(f);
+    const ext = path.posix.extname(f);
+    if (s.extensions?.some((e) => e === ext)) return f;
+    if (s.pathSegments?.some((seg) => f.includes(seg))) return f;
+    if (s.basenamePrefixes?.some((p) => base.startsWith(p))) return f;
+    if (s.exactBasenames?.some((b) => b === base)) return f;
+  }
+  return null;
+}
+
+/** Test-file detection: path segment OR `.test.` / `.spec.` infix in basename. */
+function findTestFile(changedFiles: readonly string[]): string | null {
+  for (const raw of changedFiles) {
+    const f = normalize(raw);
+    const base = path.posix.basename(f);
+    if (inTestDir(f) || /\.test\./.test(base) || /\.spec\./.test(base)) {
+      return f;
+    }
+  }
+  return null;
+}
+
+/** Source files = performance-surface extensions, minus test files. */
+function findNonTestSourceFile(changedFiles: readonly string[]): string | null {
+  const performanceSurface = SURFACE_RULES.performance as Surface;
+  for (const raw of changedFiles) {
+    const f = normalize(raw);
+    const base = path.posix.basename(f);
+    const ext = path.posix.extname(f);
+    if (
+      performanceSurface.extensions?.some((e) => e === ext) &&
+      !/\.test\./.test(base) &&
+      !/\.spec\./.test(base) &&
+      !inTestDir(f)
+    ) {
+      return f;
+    }
+  }
+  return null;
+}
+
+function resolveModel(
+  lensId: LensId,
+  overrides: LensConfig["lensModels"],
+): Model {
+  return overrides?.[lensId] ?? LENSES[lensId].defaultModel;
+}
+
+function buildOpts(
+  lensId: LensId,
+  config: LensConfig,
+  focusMissingCoverage: boolean,
+): Record<string, unknown> {
+  if (lensId === "security" && config.scannerFindings !== undefined) {
+    return { scannerFindings: config.scannerFindings };
+  }
+  if (
+    lensId === "performance" &&
+    config.hotPaths !== undefined &&
+    config.hotPaths.length > 0
+  ) {
+    return { hotPaths: config.hotPaths };
+  }
+  if (lensId === "test-quality" && focusMissingCoverage) {
+    return { focusMissingCoverage: true };
+  }
+  return {};
+}
+
+/**
+ * Decide which lenses to activate for a review. Pure -- same input always
+ * yields the same output. The list is ordered by `LENSES` declaration order
+ * (security, error-handling, clean-code, performance, api-design,
+ * concurrency, test-quality, accessibility) so `maxLenses` truncation drops
+ * the tail and keeps the highest-priority core lenses.
+ *
+ * `changedFiles` is ignored when `stage === "PLAN_REVIEW"`. The test-quality
+ * missing-coverage heuristic (which sets opts.focusMissingCoverage=true)
+ * runs only in CODE_REVIEW -- renderPlanReview ignores opts anyway.
+ */
+export function activate(args: {
+  stage: Stage;
+  changedFiles: readonly string[];
+  config?: LensConfig;
+}): LensActivation[] {
+  const { stage, changedFiles } = args;
+  const config: LensConfig = args.config ?? {};
+
+  const explicitAllow = Array.isArray(config.lenses)
+    ? new Set<LensId>(config.lenses)
+    : null;
+
+  const activations: LensActivation[] = [];
+
+  for (const lensId of LENS_IDS) {
+    if (explicitAllow !== null && !explicitAllow.has(lensId)) continue;
+
+    let activationReason: string | null = null;
+    let focusMissingCoverage = false;
+
+    if (explicitAllow !== null) {
+      activationReason = "explicit lens allow-list";
+    } else if (stage === "PLAN_REVIEW") {
+      activationReason = "plan review: all lenses";
+    } else {
+      const rule = SURFACE_RULES[lensId];
+      if (rule === "core") {
+        activationReason = "core lens";
+      } else if (rule === "test-quality-dual-mode") {
+        const testHit = findTestFile(changedFiles);
+        if (testHit !== null) {
+          activationReason = `test file changed (${testHit})`;
+        } else {
+          const srcHit = findNonTestSourceFile(changedFiles);
+          if (srcHit !== null) {
+            activationReason = `source changed without tests (${srcHit})`;
+            focusMissingCoverage = true;
+          }
+        }
+      } else {
+        const hit = matchesSurface(changedFiles, rule);
+        if (hit !== null) activationReason = `surface match: ${hit}`;
+      }
+    }
+
+    if (activationReason === null) continue;
+
+    activations.push({
+      lensId,
+      model: resolveModel(lensId, config.lensModels),
+      activationReason,
+      opts: buildOpts(lensId, config, focusMissingCoverage),
+    });
+  }
+
+  if (
+    config.maxLenses !== undefined &&
+    activations.length > config.maxLenses
+  ) {
+    return activations.slice(0, config.maxLenses);
+  }
+  return activations;
+}
