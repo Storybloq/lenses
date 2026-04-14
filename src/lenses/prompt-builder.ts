@@ -34,11 +34,19 @@ export type PreambleConfigInput = z.input<typeof PreambleConfigSchema>;
  * straight into the shared preamble where `untrusted()` wraps them in
  * `<untrusted-context>` blocks -- the wrapper is the trust boundary, no
  * separate validation happens here.
+ *
+ * Exported as a Zod schema so the MCP tool layer (T-008) can parse it at the
+ * wire boundary without redeclaring the shape. The paired type is derived via
+ * `z.infer`, so drift between the validator and the interface it feeds is a
+ * compile error, not a runtime cast.
  */
-export interface ProjectContext {
-  readonly projectRules?: string;
-  readonly knownFalsePositives?: string;
-}
+export const ProjectContextSchema = z
+  .object({
+    projectRules: z.string().optional(),
+    knownFalsePositives: z.string().optional(),
+  })
+  .strict();
+export type ProjectContext = z.infer<typeof ProjectContextSchema>;
 
 /**
  * Output shape -- one per activated lens. `lensId` is what the rest of the

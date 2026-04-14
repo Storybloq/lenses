@@ -10,8 +10,12 @@ export type Stage = z.infer<typeof StageSchema>;
  * Fields shared by every StartParams stage. Spread into each discriminated
  * branch because Zod 3's discriminatedUnion requires each arm to be a plain
  * ZodObject (no intersections).
+ *
+ * Exported so T-008's `StartToolInputSchema` can reuse the exact same shape
+ * without structural duplication -- a single source of truth keeps the MCP
+ * tool input and the preamble's expected review envelope in lockstep.
  */
-const sharedShape = {
+export const sharedStartShape = {
   artifact: z.string(),
   ticketDescription: z.string().nullable(),
   reviewRound: z.number().int().min(1),
@@ -29,14 +33,14 @@ export const StartParamsSchema = z.discriminatedUnion("stage", [
   z
     .object({
       stage: z.literal("PLAN_REVIEW"),
-      ...sharedShape,
+      ...sharedStartShape,
     })
     .strict(),
   z
     .object({
       stage: z.literal("CODE_REVIEW"),
       changedFiles: z.array(z.string().min(1)).nonempty(),
-      ...sharedShape,
+      ...sharedStartShape,
     })
     .strict(),
 ]);
