@@ -4,6 +4,7 @@ import {
   type DeferralKey,
   type StartParams,
 } from "../../schema/index.js";
+import { untrusted } from "./untrusted.js";
 
 /**
  * Lens-identity and per-lens config supplied by the caller (T-007). These are
@@ -38,24 +39,6 @@ interface OptionalContext {
  * coupling in deferrals, etc.) is enforced before we render.
  */
 export type SharedPreambleParams = StartParams & LensFields & OptionalContext;
-
-/** Zero-width space used to defang a smuggled closing-tag substring. */
-const ZWSP = "\u200B";
-
-const UNTRUSTED_CLOSE = "</untrusted-context>";
-
-/**
- * Wrap an untrusted value in a delimited block so the model can distinguish
- * data from instructions. If the value contains the literal closing tag, we
- * splice in a zero-width space to break the match without changing the text's
- * semantic meaning.
- */
-function untrusted(name: string, body: string): string {
-  const safe = body.includes(UNTRUSTED_CLOSE)
-    ? body.split(UNTRUSTED_CLOSE).join(`</${ZWSP}untrusted-context>`)
-    : body;
-  return `<untrusted-context name="${name}">\n${safe}\n</untrusted-context>`;
-}
 
 /** Render a single deferral line using the DeferralKeySchema tuple. */
 function renderDeferral(d: DeferralKey): string {
