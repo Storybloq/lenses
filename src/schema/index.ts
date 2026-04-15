@@ -24,7 +24,6 @@ export {
 
 export {
   CompleteParamsSchema,
-  sharedStartShape,
   StageSchema,
   StartParamsSchema,
   type CompleteParams,

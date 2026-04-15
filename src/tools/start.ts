@@ -21,7 +21,8 @@ import {
   ProjectContextSchema,
 } from "../lenses/prompt-builder.js";
 import { LensFindingSchema, type LensFinding } from "../schema/finding.js";
-import { sharedStartShape, type StartParams } from "../schema/index.js";
+import { type StartParams } from "../schema/index.js";
+import { sharedStartShape } from "../schema/params.js";
 import {
   registerReview,
   type CachedLensEntry,

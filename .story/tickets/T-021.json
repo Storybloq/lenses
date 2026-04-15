@@ -1,0 +1,13 @@
+{
+  "blockedBy": [],
+  "claimedBySession": "dc118ade-fbfb-4823-b8d8-3974ce023ba8",
+  "completedDate": "2026-04-15",
+  "createdDate": "2026-04-15",
+  "description": "Add public API surface so downstream consumers (claudestory adapter, any future tooling) can import typed schemas from @amirshayegh/lenses without inlining parallel type definitions.\n\nCurrently src/index.ts only exports the MCP server main entry. Adapter consumers need:\n- ReviewVerdictSchema + ReviewVerdict type\n- MergedFinding type\n- LensFinding + LensFindingSchema\n- DeferralKey + DeferralKeySchema\n- SeveritySchema + Severity type\n- Stage type\n- LensId type (from lenses/prompts)\n\nScope:\n- Add src/index.ts re-exports only. No new logic.\n- Include a small smoke test: `import { ReviewVerdictSchema } from \"@amirshayegh/lenses\"` parses a minimal valid verdict.\n- Update package.json `\"exports\"` field if needed to surface the types.\n- Do NOT expose internal modules (merger internals, cache internals, state machine) -- adapter consumers should not reach into those.\n\nUnblocks T-016 (claudestory adapter) when it is picked up later in a fresh claudestory session. Fully in-scope for the lenses repo; no cross-repo changes.",
+  "id": "T-021",
+  "order": 50,
+  "phase": "integration",
+  "status": "complete",
+  "title": "Public API exports -- src/index.ts re-exports for downstream consumers",
+  "type": "task"
+}
