@@ -16,7 +16,19 @@
  */
 
 import type { LensId } from "../lenses/prompts/index.js";
-import type { DeferralKey, Stage } from "../schema/index.js";
+import type { DeferralKey, LensFinding, Stage } from "../schema/index.js";
+
+/**
+ * Cached lens output rehydrated at hop-1 from `lens-cache.ts`. Mirrors
+ * the shape of a live `LensOutput` with `status: "ok"` (cached error
+ * outputs are not persisted by design -- see lens-cache.ts header).
+ * Carried on the session so hop-2 can re-inject these entries into
+ * `perLens` without an additional disk read.
+ */
+export interface CachedLensEntry {
+  readonly findings: readonly LensFinding[];
+  readonly notes: string | null;
+}
 
 export type ReviewStatus = "started" | "complete";
 
@@ -37,6 +49,24 @@ export interface ReviewSession {
   readonly priorDeferrals: readonly DeferralKey[];
   readonly startedAt: number;
   readonly status: ReviewStatus;
+  /**
+   * T-015: lens results resolved from the disk cache at hop-1. Empty
+   * map when T-015 is disabled or all lenses miss. `validateAndComplete`
+   * treats any lens with an entry here as already-provided so the
+   * agent only has to submit results for the spawned (non-cached)
+   * lenses. `complete.ts` re-injects these into `perLens` before
+   * running the merger so cached findings pass through dedup,
+   * confidence-filter, tension, and blocking-policy the same way
+   * fresh findings do.
+   */
+  readonly cachedResults: ReadonlyMap<LensId, CachedLensEntry>;
+  /**
+   * T-015: SHA-256 prompt hash for every activated lens (cached OR
+   * spawned). `complete.ts` reads this map to know what hash to write
+   * against each lensId on cache update. Mapped value is the hex
+   * string as produced by `hashLensPrompt(prompt)`.
+   */
+  readonly promptHashes: ReadonlyMap<LensId, string>;
 }
 
 /**
@@ -79,6 +109,8 @@ export function registerReview(params: {
   readonly expectedLensIds: readonly LensId[];
   readonly reviewRound: number;
   readonly priorDeferrals: readonly DeferralKey[];
+  readonly cachedResults?: ReadonlyMap<LensId, CachedLensEntry>;
+  readonly promptHashes?: ReadonlyMap<LensId, string>;
 }): void {
   if (sessions.has(params.reviewId)) {
     throw new Error(
@@ -94,6 +126,11 @@ export function registerReview(params: {
     priorDeferrals: params.priorDeferrals,
     startedAt: Date.now(),
     status: "started",
+    // T-015: defaults ensure pre-T-015 call sites (and tests that
+    // don't care about caching) see the same shape without having to
+    // pass empty maps everywhere.
+    cachedResults: params.cachedResults ?? new Map(),
+    promptHashes: params.promptHashes ?? new Map(),
   });
 }
 
@@ -132,7 +169,15 @@ export function validateAndComplete(params: {
       message: `review state: reviewId already completed: ${params.reviewId}`,
     };
   }
+  // T-015: a lens present in `session.cachedResults` was already
+  // resolved at hop-1 time from the disk cache, so the agent was
+  // instructed NOT to spawn it. The submission legitimately omits
+  // those lenses; treat them as covered here alongside the agent's
+  // fresh results. Fresh wins on overlap -- that tie-break is a
+  // merger-layer concern; at this boundary we only care whether the
+  // union covers the expected set.
   const provided = new Set<string>(params.providedLensIds);
+  for (const lensId of session.cachedResults.keys()) provided.add(lensId);
   const missing = session.expectedLensIds.filter((id) => !provided.has(id));
   if (missing.length > 0) {
     return {

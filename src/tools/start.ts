@@ -7,20 +7,25 @@ import type {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
+import { hashLensPrompt, readLensCache } from "../cache/lens-cache.js";
 import {
   activate,
   LensConfigSchema,
   LensIdSchema,
   ModelSchema,
 } from "../lenses/registry.js";
+import type { LensId } from "../lenses/prompts/index.js";
 import {
   buildAgentPrompts,
   PreambleConfigSchema,
   ProjectContextSchema,
 } from "../lenses/prompt-builder.js";
-import { LensFindingSchema } from "../schema/finding.js";
+import { LensFindingSchema, type LensFinding } from "../schema/finding.js";
 import { sharedStartShape, type StartParams } from "../schema/index.js";
-import { registerReview } from "../state/review-state.js";
+import {
+  registerReview,
+  type CachedLensEntry,
+} from "../state/review-state.js";
 
 export const LENS_REVIEW_START_NAME = "lens_review_start";
 
@@ -119,15 +124,39 @@ export const lensReviewStartDefinition = {
 } satisfies ListToolsResult["tools"][number];
 
 /**
- * Build the Hop-1 response: activate → assemble → wire-rename. Pure wrt its
- * inputs; the ONLY side effect is the reviewId generated via
- * `crypto.randomUUID()` (nondeterminism is contained to that one call so
- * tests can assert shape but not value).
+ * Attempt a cache read for one activated lens. Best-effort: a throw
+ * from `readLensCache` (shouldn't, but defense-in-depth against a
+ * future refactor) is logged and treated as a miss so a broken cache
+ * cannot block the review.
+ */
+function tryCacheRead(
+  lensId: LensId,
+  promptHash: string,
+): CachedLensEntry | undefined {
+  try {
+    const hit = readLensCache(lensId, promptHash);
+    if (!hit) return undefined;
+    return { findings: hit.findings, notes: hit.notes };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`lens_review_start: lens cache read failed: ${message}`);
+    return undefined;
+  }
+}
+
+/**
+ * Build the Hop-1 response: activate → assemble → resolve-cache →
+ * wire-rename. Pure wrt its inputs except for the reviewId generated
+ * via `crypto.randomUUID()` and the best-effort disk reads done by
+ * `readLensCache`. A cache read throw is swallowed per RULES.md §4 --
+ * the lens is treated as a miss and re-spawned.
  *
- * `cached` is always `[]` in T-008. T-015 will introduce per-lens caching
- * that prunes activations before prompt assembly and populates `cached`
- * from stored prior findings -- the response field is already shaped so
- * that wiring is additive, not a contract change.
+ * T-015 pipeline: for each activated lens, compute a stable prompt
+ * hash, consult the disk cache, and split into `agents` (miss -- the
+ * agent must spawn) and `cached` (hit -- the agent skips). Cached
+ * entries AND the full `promptHashes` map land on the ReviewSession
+ * so hop-2 can re-inject findings and write fresh entries without
+ * a second disk read.
  */
 function buildResponse(parsed: StartToolInput): StartToolOutput {
   // `StartToolInputSchema` is a superset of `StartParamsSchema` (it adds
@@ -146,39 +175,65 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
     config: lensConfig,
   });
 
-  const agents = buildAgentPrompts({
+  const built = buildAgentPrompts({
     activations,
     startParams,
     preambleConfig,
     ...(projectContext !== undefined ? { projectContext } : {}),
   });
 
+  // T-015 cache resolution. Split each activated lens into hit (goes
+  // to `cachedEntries`) or miss (stays in `spawnedAgents`).
+  // `promptHashes` tracks the hash for EVERY activated lens, cached
+  // or not, so hop-2 can write fresh results under the right key.
+  // `expectedLensIds` is the FULL activation list (hits + misses):
+  // the state machine enforces coverage across the union, and cached
+  // lenses are covered by `cachedResults`.
+  const promptHashes = new Map<LensId, string>();
+  const cachedEntries = new Map<LensId, CachedLensEntry>();
+  const cachedWire: Array<{ id: LensId; findings: LensFinding[] }> = [];
+  const spawnedAgents: typeof built = [];
+  for (const agent of built) {
+    const promptHash = hashLensPrompt(agent.prompt);
+    promptHashes.set(agent.lensId, promptHash);
+    const hit = tryCacheRead(agent.lensId, promptHash);
+    if (hit) {
+      cachedEntries.set(agent.lensId, hit);
+      cachedWire.push({ id: agent.lensId, findings: [...hit.findings] });
+    } else {
+      spawnedAgents.push(agent);
+    }
+  }
+
   // Track the review in the T-020 state machine BEFORE returning so the
   // complementary `lens_review_complete` handler (T-009) can enforce
   // reviewId validity, lens coverage, and one-shot completion. In T-014
   // we also resolve (or mint) the cross-round `sessionId` here so the
   // complete-time path can build a `RoundRecord` without reparsing the
-  // start-time envelope. Start-time does NOT read the disk cache --
-  // T-015 owns that path.
+  // start-time envelope. T-015 additionally stashes the cached entries
+  // and prompt-hash map so hop-2 can rehydrate findings and update the
+  // cache without re-reading the prompts.
   const reviewId = randomUUID();
   const sessionId = parsed.sessionId ?? randomUUID();
   registerReview({
     reviewId,
     sessionId,
     stage: parsed.stage,
-    expectedLensIds: agents.map((a) => a.lensId),
+    expectedLensIds: built.map((a) => a.lensId),
     reviewRound: parsed.reviewRound,
     priorDeferrals: parsed.priorDeferrals,
+    cachedResults: cachedEntries,
+    promptHashes,
   });
 
   return {
     reviewId,
-    agents: agents.map(({ lensId, model, prompt }) => ({
+    agents: spawnedAgents.map(({ lensId, model, prompt }) => ({
       id: lensId,
       model,
       prompt,
     })),
-    cached: [],
+    cached: cachedWire,
   };
 }
 

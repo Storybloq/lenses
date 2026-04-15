@@ -1,4 +1,11 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,18 +31,33 @@ import { handleLensReviewStart } from "../src/tools/start.js";
 // complete. Pin `LENSES_SESSION_DIR` to a per-file temp dir so test
 // runs don't pollute the real tmp/lenses-sessions directory and so
 // two test files don't race against each other on the same sessionId.
+// T-015 applies the same isolation to the per-lens cache: without a
+// per-file cache dir, hits from prior runs would make `agents` come
+// back empty and `cachedResults` would smuggle extra lens coverage
+// into state-machine assertions.
 let sessionDir: string;
+let lensCacheDir: string;
 beforeAll(() => {
   sessionDir = mkdtempSync(join(tmpdir(), "lenses-tools-complete-"));
+  lensCacheDir = mkdtempSync(join(tmpdir(), "lenses-tools-complete-lc-"));
   process.env.LENSES_SESSION_DIR = sessionDir;
+  process.env.LENSES_LENS_CACHE_DIR = lensCacheDir;
 });
 afterAll(() => {
   delete process.env.LENSES_SESSION_DIR;
+  delete process.env.LENSES_LENS_CACHE_DIR;
   rmSync(sessionDir, { recursive: true, force: true });
+  rmSync(lensCacheDir, { recursive: true, force: true });
 });
 
+// Clear BOTH the in-memory state and the on-disk lens cache between
+// every it() so each legacy test starts from a true miss regardless
+// of ordering. The dedicated T-015 integration tests (below) manage
+// their own fixtures explicitly when they need round-to-round
+// continuity.
 beforeEach(() => {
   _resetForTests();
+  rmSync(lensCacheDir, { recursive: true, force: true });
 });
 
 function finding(
@@ -575,6 +597,502 @@ describe("handleLensReviewComplete -- sessionId decoupling (T-014)", () => {
     const stored = readSession(orphanSessionId);
     expect(stored).toBeDefined();
     expect(stored!.rounds).toHaveLength(1);
+  });
+});
+
+/**
+ * T-015 per-lens cache. These tests drive the full two-hop flow
+ * (start → complete → start) and make assertions about what lands on
+ * disk vs what gets re-injected as `cached[...]` on the next round.
+ * Plan §8c is the source of truth for what each case pins.
+ *
+ * Why drive start twice rather than pre-seed via `writeLensCache`:
+ * these tests are about the WRITE path in `complete.ts` and the
+ * round-trip semantics (errors don't cache, cached entries participate
+ * in the merger, etc). Pre-seeding skips the code under test.
+ */
+describe("handleLensReviewComplete -- T-015 per-lens cache (§8c)", () => {
+  /**
+   * Glob the current lens cache dir for JSON files with a given
+   * lensId prefix. `writeLensCache` names files
+   * `<lensId>-<promptHash>.json`, so a prefix match uniquely
+   * identifies a lens's cache entry without needing to recompute the
+   * hash in the test.
+   */
+  function cacheFilesFor(lensId: LensId): string[] {
+    return readdirSync(lensCacheDir).filter(
+      (f) => f.startsWith(`${lensId}-`) && f.endsWith(".json"),
+    );
+  }
+
+  it("§8c-1: round 1 with ok results writes one cache file per lens", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    expect(lensIds.sort()).toEqual(["clean-code", "security"]);
+    const results = lensIds.map((id) => ({ lensId: id, output: ok() }));
+    const { isError } = await callComplete({ reviewId, results });
+    expect(isError).toBe(false);
+    expect(cacheFilesFor("security")).toHaveLength(1);
+    expect(cacheFilesFor("clean-code")).toHaveLength(1);
+  });
+
+  it("§8c-2: round-2 hop-1 returns cached findings and hop-2 accepts partial results", async () => {
+    const args = {
+      lensConfig: { lenses: ["security", "clean-code"] as string[] },
+    };
+    // Round 1: security emits a major finding, clean-code empty. Both
+    // get cached. Category is deliberately NOT in
+    // `DEFAULT_ALWAYS_BLOCK` ("injection" etc.) so the blocking
+    // policy does not promote the severity -- this test pins the
+    // round-trip of a plain major finding through the cache, not
+    // the policy-promotion behavior.
+    const securityFinding = finding("major", {
+      id: "s-1",
+      category: "token-leak",
+      file: "src/auth.ts",
+      line: 12,
+      description: "unchecked input",
+      suggestion: "validate",
+      confidence: 0.9,
+    });
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output: id === "security" ? ok([securityFinding]) : ok(),
+      }));
+      const r1 = await callComplete({ reviewId, results });
+      expect(r1.isError).toBe(false);
+    }
+
+    // Round 2: identical inputs INCLUDING reviewRound -- the prompt
+    // embeds the round number, so a different round would legitimately
+    // miss the cache (different hash). "Immediate identical" per
+    // plan §11 acceptance means every field equal.
+    const r2Start = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const r2First = r2Start.content[0];
+    if (!r2First || r2First.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(r2First.text)) as {
+      reviewId: string;
+      agents: Array<{ id: LensId }>;
+      cached: Array<{ id: LensId; findings: LensFinding[] }>;
+    };
+    expect(r2Body.agents).toEqual([]);
+    expect(r2Body.cached.map((c) => c.id).sort()).toEqual([
+      "clean-code",
+      "security",
+    ]);
+
+    // Hop-2 with empty results still succeeds because the state
+    // machine treats cached lenses as covered, and the merger
+    // re-injects the cached findings.
+    const { isError, body } = await callComplete({
+      reviewId: r2Body.reviewId,
+      results: [],
+    });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.major).toBe(1);
+    expect(verdict.findings).toHaveLength(1);
+    expect(verdict.findings[0]?.category).toBe("token-leak");
+    expect(verdict.findings[0]?.contributingLenses).toContain("security");
+  });
+
+  it("§8c-3: cached findings participate in the confidence floor", async () => {
+    // Round 1: cache a finding whose confidence is below a strict
+    // floor we'll set at round 2. Uses a minor severity so it doesn't
+    // hit blocking-policy promotion.
+    const args = { lensConfig: { lenses: ["clean-code"] as string[] } };
+    const lowConfFinding = finding("minor", {
+      id: "c-1",
+      category: "naming",
+      confidence: 0.5,
+    });
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output: ok([lowConfFinding]),
+      }));
+      expect((await callComplete({ reviewId, results })).isError).toBe(false);
+    }
+
+    // Round 2: identical inputs. The cache hit depends on the prompt
+    // being byte-equal, which means reviewRound must match (the
+    // preamble embeds it). Merger receives the cached finding and
+    // drops it against the strict confidenceFloor the same way it
+    // would have for a fresh finding.
+    const r2Start = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const r2First = r2Start.content[0];
+    if (!r2First || r2First.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(r2First.text)) as {
+      reviewId: string;
+    };
+    const { body } = await callComplete({
+      reviewId: r2Body.reviewId,
+      results: [],
+      mergerConfig: { confidenceFloor: 0.8 },
+    });
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.minor).toBe(0);
+    expect(verdict.findings).toHaveLength(0);
+  });
+
+  it("§8c-4: a cached finding dedups against a fresh finding from another lens at the same key", async () => {
+    // Round 1: both lenses return ok, but only security has a
+    // finding at (src/x.ts, 10, taint). Both get cached; clean-code's
+    // cache is empty. Category chosen to avoid alwaysBlock promotion.
+    const args = {
+      lensConfig: { lenses: ["security", "clean-code"] as string[] },
+    };
+    const sharedKey = finding("minor", {
+      id: "s-1",
+      category: "taint",
+      file: "src/x.ts",
+      line: 10,
+      confidence: 0.9,
+    });
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output: id === "security" ? ok([sharedKey]) : ok(),
+      }));
+      await callComplete({ reviewId, results });
+    }
+
+    // Second start with identical inputs. Security hits the cache
+    // with its one finding. Clean-code ALSO hits cache (empty). But
+    // the agent re-submits clean-code with a finding at the SAME
+    // (file, line, category) key as security's cached one, simulating
+    // a round where clean-code independently flagged the same issue.
+    // Fresh wins over cached for clean-code; the merger then
+    // deduplicates the (security cached) + (clean-code fresh) pair
+    // into one merged finding with two contributing lenses.
+    const r2 = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const first = r2.content[0];
+    if (!first || first.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(first.text)) as {
+      reviewId: string;
+      cached: Array<{ id: LensId }>;
+    };
+    expect(r2Body.cached.map((c) => c.id).sort()).toEqual([
+      "clean-code",
+      "security",
+    ]);
+    const freshSameKey = finding("minor", {
+      id: "cc-1",
+      category: "taint",
+      file: "src/x.ts",
+      line: 10,
+      confidence: 0.7,
+    });
+    const { isError, body } = await callComplete({
+      reviewId: r2Body.reviewId,
+      results: [{ lensId: "clean-code", output: ok([freshSameKey]) }],
+    });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.findings).toHaveLength(1);
+    expect(verdict.findings[0]?.contributingLenses.sort()).toEqual([
+      "clean-code",
+      "security",
+    ]);
+    // Higher-confidence (security's 0.9) wins the confidence tiebreak.
+    expect(verdict.findings[0]?.id).toBe("s-1");
+    expect(verdict.findings[0]?.confidence).toBe(0.9);
+  });
+
+  it("§8c-5: status:error outputs are NOT cached (round 2 re-spawns)", async () => {
+    const args = { lensConfig: { lenses: ["security"] as string[] } };
+    const { reviewId, lensIds } = await startPlanReview(args);
+    const results = lensIds.map((id) => ({
+      lensId: id,
+      output: {
+        status: "error" as const,
+        error: "transient failure",
+        findings: [] as LensFinding[],
+        notes: null,
+      },
+    }));
+    expect((await callComplete({ reviewId, results })).isError).toBe(false);
+    expect(cacheFilesFor("security")).toHaveLength(0);
+
+    // Re-open with the SAME reviewRound so the prompt hash is
+    // identical to round 1. With reviewRound: 2 the preamble embeds a
+    // different round number, the hash changes, and the re-spawn
+    // assertion would be vacuous (ANY new round misses). Keeping
+    // round 1 ensures this test exercises the error-skip-write guard,
+    // not the round-number hash differential.
+    const r2 = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const first = r2.content[0];
+    if (!first || first.type !== "text") throw new Error();
+    const body = JSON.parse(String(first.text)) as {
+      agents: Array<{ id: LensId }>;
+      cached: Array<{ id: LensId }>;
+    };
+    expect(body.cached).toEqual([]);
+    expect(body.agents.map((a) => a.id)).toEqual(["security"]);
+  });
+
+  it("§8c-6: synthetic-error results (unknown lens id) are NOT cached", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security"] },
+    });
+    // Submit the real lens ok, PLUS an unknown lens id which the
+    // handler coerces to synthetic error. The real lens IS cached;
+    // the unknown one must not produce any file.
+    const results = [
+      ...lensIds.map((id) => ({ lensId: id, output: ok() })),
+      { lensId: "not-a-real-lens", output: ok() },
+    ];
+    expect((await callComplete({ reviewId, results })).isError).toBe(false);
+    expect(cacheFilesFor("security")).toHaveLength(1);
+    // Nothing resembling the fake id should be on disk.
+    const allFiles = readdirSync(lensCacheDir);
+    for (const f of allFiles) {
+      expect(f.startsWith("not-a-real-lens-")).toBe(false);
+    }
+  });
+
+  it("§8c-7: a previously-errored lens gets cached once it eventually succeeds", async () => {
+    const args = { lensConfig: { lenses: ["security"] as string[] } };
+    // Round 1: error → no cache.
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output: {
+          status: "error" as const,
+          error: "timeout",
+          findings: [] as LensFinding[],
+          notes: null,
+        },
+      }));
+      await callComplete({ reviewId, results });
+    }
+    expect(cacheFilesFor("security")).toHaveLength(0);
+
+    // Round 2: ok → cache written.
+    {
+      const { reviewId, lensIds } = await startPlanReview({
+        ...args,
+        reviewRound: 2,
+      });
+      const results = lensIds.map((id) => ({ lensId: id, output: ok() }));
+      expect((await callComplete({ reviewId, results })).isError).toBe(false);
+    }
+    expect(cacheFilesFor("security")).toHaveLength(1);
+  });
+
+  it("§8c-8: RULES §4 -- a lens-cache write failure does NOT turn a successful review into isError", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security"] },
+    });
+    const results = lensIds.map((id) => ({ lensId: id, output: ok() }));
+
+    // Break the lens-cache dir the same way the session-cache test
+    // does: point at a regular file so mkdirSync({recursive: true})
+    // raises ENOTDIR. Session cache stays valid (different env var)
+    // so this test isolates the lens-cache failure path.
+    const originalDir = process.env.LENSES_LENS_CACHE_DIR;
+    const brokenPath = join(lensCacheDir, "not-a-dir");
+    writeFileSync(brokenPath, "i am a file, not a directory");
+    process.env.LENSES_LENS_CACHE_DIR = brokenPath;
+    try {
+      const { isError, body } = await callComplete({ reviewId, results });
+      expect(isError).toBe(false);
+      const verdict = ReviewVerdictSchema.parse(body);
+      expect(verdict.verdict).toBe("approve");
+    } finally {
+      process.env.LENSES_LENS_CACHE_DIR = originalDir;
+    }
+  });
+
+  it("§8c-9: a round-2 submission omitting a cached lens is accepted", async () => {
+    const args = {
+      lensConfig: { lenses: ["security", "clean-code"] as string[] },
+    };
+    // Round 1: populate both lenses.
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({ lensId: id, output: ok() }));
+      await callComplete({ reviewId, results });
+    }
+
+    // Second start with identical inputs -- both must hit the
+    // cache. Agent sends [] → still covered.
+    const r2 = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const first = r2.content[0];
+    if (!first || first.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(first.text)) as { reviewId: string };
+    const { isError } = await callComplete({
+      reviewId: r2Body.reviewId,
+      results: [],
+    });
+    expect(isError).toBe(false);
+  });
+
+  it("§8c-10: omitting a non-cached lens still returns missing_lenses", async () => {
+    const args = {
+      lensConfig: { lenses: ["security", "clean-code"] as string[] },
+    };
+    // Round 1: only cache security (ok); clean-code errors so no cache.
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output:
+          id === "security"
+            ? ok()
+            : {
+                status: "error" as const,
+                error: "boom",
+                findings: [] as LensFinding[],
+                notes: null,
+              },
+      }));
+      await callComplete({ reviewId, results });
+    }
+    expect(cacheFilesFor("security")).toHaveLength(1);
+    expect(cacheFilesFor("clean-code")).toHaveLength(0);
+
+    // Second start with identical inputs → hop-1 returns security
+    // cached + clean-code agent. Agent sends [] → state machine
+    // rejects (clean-code not covered).
+    const r2 = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const first = r2.content[0];
+    if (!first || first.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(first.text)) as {
+      reviewId: string;
+      cached: Array<{ id: LensId }>;
+      agents: Array<{ id: LensId }>;
+    };
+    expect(r2Body.cached.map((c) => c.id)).toEqual(["security"]);
+    expect(r2Body.agents.map((a) => a.id)).toEqual(["clean-code"]);
+    const { isError, text } = await callComplete({
+      reviewId: r2Body.reviewId,
+      results: [],
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain("missing 1 expected lens result(s)");
+    expect(text).toContain("clean-code");
+  });
+
+  it("§8c-11: hop-2 does NOT re-write the cache file of a lens returned as cached in hop-1 (mtime unchanged)", async () => {
+    const args = { lensConfig: { lenses: ["security"] as string[] } };
+    // Round 1: populate cache for security.
+    {
+      const { reviewId, lensIds } = await startPlanReview(args);
+      const results = lensIds.map((id) => ({ lensId: id, output: ok() }));
+      await callComplete({ reviewId, results });
+    }
+    const files = cacheFilesFor("security");
+    expect(files).toHaveLength(1);
+    const cachePath = join(lensCacheDir, files[0]!);
+    const beforeMtime = statSync(cachePath).mtimeMs;
+
+    // Small delay so a hypothetical rewrite would register a newer
+    // mtime. Node's mtime resolution is 1ms on most filesystems.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Second start with identical inputs → hop-1 returns cached,
+    // agent submits []. The skip guard in persistLensCacheBestEffort
+    // must prevent any rewrite.
+    const r2 = await handleLensReviewStart({
+      method: "tools/call",
+      params: {
+        name: "lens_review_start",
+        arguments: {
+          stage: "PLAN_REVIEW",
+          artifact: "## Plan\n\nDo the thing.",
+          ticketDescription: null,
+          reviewRound: 1,
+          ...args,
+        },
+      },
+    });
+    const first = r2.content[0];
+    if (!first || first.type !== "text") throw new Error();
+    const r2Body = JSON.parse(String(first.text)) as { reviewId: string };
+    await callComplete({ reviewId: r2Body.reviewId, results: [] });
+
+    expect(existsSync(cachePath)).toBe(true);
+    const afterMtime = statSync(cachePath).mtimeMs;
+    expect(afterMtime).toBe(beforeMtime);
   });
 });
 

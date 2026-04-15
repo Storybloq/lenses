@@ -168,3 +168,74 @@ describe("validateAndComplete", () => {
     expect(getReview(RID)?.status).toBe("complete");
   });
 });
+
+/**
+ * T-015: cached lenses are treated as already-provided by the state
+ * machine, so the agent's submission only needs to cover the spawned
+ * (non-cached) subset of expectedLensIds. These three cases pin the
+ * relaxed union semantics at the unit level (plan §8b') instead of
+ * relying solely on the integration coverage in tools-complete.test.
+ */
+describe("validateAndComplete with T-015 cachedResults", () => {
+  it("providedLensIds partial but cachedLensIds covers the gap → ok", () => {
+    register({
+      cachedResults: new Map([
+        [
+          "performance",
+          { findings: [], notes: null },
+        ],
+      ]),
+    });
+    const v = validateAndComplete({
+      reviewId: RID,
+      providedLensIds: ["security", "clean-code"],
+    });
+    expect(v.ok).toBe(true);
+    if (!v.ok) throw new Error();
+    expect(v.session.status).toBe("complete");
+  });
+
+  it("neither provided nor cached covers an expected lens → missing_lenses", () => {
+    register({
+      cachedResults: new Map([
+        [
+          "performance",
+          { findings: [], notes: null },
+        ],
+      ]),
+    });
+    const v = validateAndComplete({
+      reviewId: RID,
+      // Missing clean-code. Cached covers performance only.
+      providedLensIds: ["security"],
+    });
+    expect(v.ok).toBe(false);
+    if (v.ok) throw new Error();
+    expect(v.code).toBe("missing_lenses");
+    if (v.code !== "missing_lenses") throw new Error();
+    expect(v.missing).toEqual(["clean-code"]);
+    // Session should remain started -- caching state must not drive
+    // a premature transition when the submission is incomplete.
+    expect(getReview(RID)?.status).toBe("started");
+  });
+
+  it("overlap between provided and cached is accepted (fresh-wins is merger-layer)", () => {
+    register({
+      cachedResults: new Map([
+        [
+          "security",
+          { findings: [], notes: null },
+        ],
+      ]),
+    });
+    // The agent submitted security too; the state machine does not
+    // care about the overlap, only about coverage.
+    const v = validateAndComplete({
+      reviewId: RID,
+      providedLensIds: ["security", "clean-code", "performance"],
+    });
+    expect(v.ok).toBe(true);
+    if (!v.ok) throw new Error();
+    expect(v.session.status).toBe("complete");
+  });
+});

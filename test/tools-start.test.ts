@@ -1,8 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
+import { hashLensPrompt, writeLensCache } from "../src/cache/lens-cache.js";
+import type { LensId } from "../src/lenses/prompts/index.js";
 import { createServer } from "../src/server.js";
 import { _resetForTests, getReview } from "../src/state/review-state.js";
 import {
@@ -11,12 +17,31 @@ import {
   StartToolOutputSchema,
 } from "../src/tools/start.js";
 
-// Every lens_review_start call registers a session in the T-020 state
-// store. Clearing the module-level Map between tests keeps this file
-// isolated from neighbors AND prevents unbounded growth once T-009
-// exercises completion paths against the same singleton.
+// T-015: the tool boundary probes the lens cache on every start. Pin
+// `LENSES_LENS_CACHE_DIR` to a per-file temp dir so test runs don't
+// pick up stale hits from the real tmp/lenses-lens-cache directory
+// and so parallel test files don't race on the same (lensId,
+// promptHash) keys. Per-test-file isolation — cross-test caching is
+// exercised by the dedicated T-015 integration suite, not here.
+let lensCacheDir: string;
+beforeAll(() => {
+  lensCacheDir = mkdtempSync(join(tmpdir(), "lenses-tools-start-lc-"));
+  process.env.LENSES_LENS_CACHE_DIR = lensCacheDir;
+});
+afterAll(() => {
+  delete process.env.LENSES_LENS_CACHE_DIR;
+  rmSync(lensCacheDir, { recursive: true, force: true });
+});
+
+// Clear BOTH the in-memory state and the on-disk lens cache between
+// every it() so each test starts from a true miss, regardless of
+// ordering.
 beforeEach(() => {
   _resetForTests();
+  rmSync(lensCacheDir, { recursive: true, force: true });
+});
+afterEach(() => {
+  rmSync(lensCacheDir, { recursive: true, force: true });
 });
 
 const UUID_V4_RE =
@@ -290,6 +315,166 @@ describe("handleLensReviewStart -- config propagation", () => {
       "security",
       "error-handling",
     ]);
+  });
+});
+
+/**
+ * T-015 hop-1 cache resolution. These tests exercise the pipeline
+ * end-to-end by pre-seeding the on-disk cache (via `writeLensCache`
+ * directly) and then calling `lens_review_start` to see which lenses
+ * are split off into `cached[]` vs `agents[]`. Pre-seeding is closer
+ * to reality than mocking because `hashLensPrompt` actually hashes the
+ * prompt the tool built, so any drift between the tool's prompt and
+ * the cache key would show up here.
+ *
+ * Plan §8b enumerates the cases below; see `src/cache/lens-cache.ts`
+ * for DISABLE / dir / TTL env-var semantics.
+ */
+describe("handleLensReviewStart -- T-015 cache resolution (§8b)", () => {
+  /**
+   * Run hop-1 once, hash each agent's prompt, and pre-populate the
+   * cache with empty findings for the given subset. Returns the map of
+   * `(lensId -> promptHash)` so downstream tests can cross-check that
+   * the second call's `cached` array lines up with what was seeded.
+   */
+  async function seedCache(
+    args: Record<string, unknown>,
+    lensIdsToSeed: readonly LensId[],
+  ): Promise<ReadonlyMap<LensId, string>> {
+    const { body } = await callStart(args);
+    const parsed = StartToolOutputSchema.parse(body);
+    const hashes = new Map<LensId, string>();
+    for (const agent of parsed.agents) {
+      hashes.set(agent.id, hashLensPrompt(agent.prompt));
+    }
+    for (const lensId of lensIdsToSeed) {
+      const promptHash = hashes.get(lensId);
+      if (promptHash === undefined) {
+        throw new Error(`seedCache: lens ${lensId} not in agents`);
+      }
+      writeLensCache({
+        lensId,
+        promptHash,
+        findings: [],
+        notes: null,
+      });
+    }
+    _resetForTests();
+    return hashes;
+  }
+
+  it("round 1 with a fresh cache returns cached=[] and agents covers expected", async () => {
+    const { body } = await callStart(
+      planReviewArgs({ lensConfig: { lenses: ["security", "clean-code"] } }),
+    );
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.cached).toEqual([]);
+    expect(parsed.agents.map((a) => a.id).sort()).toEqual([
+      "clean-code",
+      "security",
+    ]);
+  });
+
+  it("identical round-2 args hit the cache for every pre-seeded lens", async () => {
+    const args = planReviewArgs({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    await seedCache(args, ["security", "clean-code"]);
+    const { body } = await callStart(args);
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.agents).toEqual([]);
+    expect(parsed.cached.map((c) => c.id).sort()).toEqual([
+      "clean-code",
+      "security",
+    ]);
+    // Every cached entry must carry the findings array (empty in this
+    // fixture); the tool should not drop or rename the field on its
+    // way to the wire.
+    for (const entry of parsed.cached) {
+      expect(entry.findings).toEqual([]);
+    }
+  });
+
+  it("cached + agents partitions the expected set (totals sum)", async () => {
+    const args = planReviewArgs({
+      lensConfig: { lenses: ["security", "clean-code", "performance"] },
+    });
+    await seedCache(args, ["security"]);
+    const { body } = await callStart(args);
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.cached.map((c) => c.id)).toEqual(["security"]);
+    expect(parsed.agents.map((a) => a.id).sort()).toEqual([
+      "clean-code",
+      "performance",
+    ]);
+  });
+
+  it("changing artifact invalidates the cache (different promptHash)", async () => {
+    const base = planReviewArgs({
+      lensConfig: { lenses: ["security"] },
+      artifact: "## Plan\n\nOriginal.",
+    });
+    await seedCache(base, ["security"]);
+    const changed = planReviewArgs({
+      lensConfig: { lenses: ["security"] },
+      artifact: "## Plan\n\nChanged text flows into a new hash.",
+    });
+    const { body } = await callStart(changed);
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.cached).toEqual([]);
+    expect(parsed.agents.map((a) => a.id)).toEqual(["security"]);
+  });
+
+  it("changing stage (PLAN→CODE) invalidates the cache", async () => {
+    const planArgs = planReviewArgs({ lensConfig: { lenses: ["security"] } });
+    await seedCache(planArgs, ["security"]);
+    const codeArgs = codeReviewArgs({
+      // security activates on CODE_REVIEW for any changed file -- use a
+      // source file so the activation registry keeps it in the set.
+      changedFiles: ["src/auth.ts"],
+      lensConfig: { lenses: ["security"] },
+    });
+    const { body } = await callStart(codeArgs);
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.cached).toEqual([]);
+    expect(parsed.agents.map((a) => a.id)).toEqual(["security"]);
+  });
+
+  it("changing preambleConfig.findingBudget invalidates the cache", async () => {
+    const base = planReviewArgs({
+      lensConfig: { lenses: ["security"] },
+      preambleConfig: { findingBudget: 10 },
+    });
+    await seedCache(base, ["security"]);
+    const changed = planReviewArgs({
+      lensConfig: { lenses: ["security"] },
+      preambleConfig: { findingBudget: 25 },
+    });
+    const { body } = await callStart(changed);
+    const parsed = StartToolOutputSchema.parse(body);
+    expect(parsed.cached).toEqual([]);
+    expect(parsed.agents.map((a) => a.id)).toEqual(["security"]);
+  });
+
+  it("LENSES_LENS_CACHE_DISABLE=1 disables reads even with cache populated", async () => {
+    const args = planReviewArgs({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // Seed cache with DISABLE unset so the file actually lands on disk.
+    await seedCache(args, ["security", "clean-code"]);
+    process.env.LENSES_LENS_CACHE_DISABLE = "1";
+    try {
+      const { body } = await callStart(args);
+      const parsed = StartToolOutputSchema.parse(body);
+      // Both lenses should be re-spawned despite the on-disk hits.
+      expect(parsed.cached).toEqual([]);
+      expect(parsed.agents.map((a) => a.id).sort()).toEqual([
+        "clean-code",
+        "security",
+      ]);
+    } finally {
+      delete process.env.LENSES_LENS_CACHE_DISABLE;
+    }
   });
 });
 
