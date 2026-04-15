@@ -4,13 +4,14 @@
     "T-011",
     "T-012"
   ],
-  "completedDate": null,
+  "claimedBySession": "efc26ffb-44b6-4cb2-88d4-d837f9c697c8",
+  "completedDate": "2026-04-14",
   "createdDate": "2026-04-13",
   "description": "Build src/merger/verdict.ts. Deterministic verdict from findings: any blocking finding -> reject, any major -> revise, only minor/suggestions -> approve. Count by severity. Recommend next round based on blocking/major count. Same findings always produce same verdict.",
   "id": "T-013",
   "order": 40,
   "phase": "merger",
-  "status": "open",
+  "status": "complete",
   "title": "Verdict computation",
   "type": "task"
 }

@@ -16,13 +16,12 @@ import {
   type LensOutput,
   type MergerConfig,
   type ReviewVerdict,
-  type Severity,
-  type Verdict,
 } from "../schema/index.js";
 
 import { applyBlockingPolicy } from "./blocking-policy.js";
 import { dedupeFindings } from "./dedup.js";
 import { detectTensions } from "./tension.js";
+import { computeVerdict } from "./verdict.js";
 
 export interface LensRunResult {
   readonly lensId: LensId;
@@ -37,10 +36,13 @@ export interface MergerInput {
 }
 
 /**
- * Baseline merger. Deduplicates cross-lens findings by `(file, line,
- * category)` (T-010), applies the blocking policy (T-011), detects
- * cross-lens tensions (T-012), counts severities over the post-policy
- * array, and derives the verdict from severity presence alone.
+ * Deduplicates cross-lens findings by `(file, line, category)` (T-010),
+ * applies the blocking policy (T-011), detects cross-lens tensions
+ * (T-012), and delegates severity counting + verdict derivation to
+ * `computeVerdict` (T-013). `recommendNextRound` from the computation
+ * is intentionally dropped here: the wire schema does not carry it,
+ * and the boolean is derivable from `blocking`/`major` on the receiver
+ * side if ever needed.
  *
  * `sessionId` is set to `reviewId` for T-009. T-014 will introduce a
  * distinct session cache where sessionId diverges from reviewId; the
@@ -50,35 +52,10 @@ export interface MergerInput {
 export function runMergerPipeline(input: MergerInput): ReviewVerdict {
   const config = input.mergerConfig ?? DEFAULT_MERGER_CONFIG;
 
-  // T-010: collapse findings that share (file, line, category) across
-  // lenses. T-011: drop below-floor findings and apply blocking policy.
-  // Severity counts drive off the post-policy array because the verdict
-  // schema's count invariant must match the emitted findings.
   const deduped = dedupeFindings(input.perLens);
   const findings = applyBlockingPolicy(deduped, config);
   const tensions = detectTensions(findings);
-
-  const counts: Record<Severity, number> = {
-    blocking: 0,
-    major: 0,
-    minor: 0,
-    suggestion: 0,
-  };
-  for (const f of findings) {
-    counts[f.severity] += 1;
-  }
-
-  // Verdict rule (baseline). ReviewVerdictSchema's superRefine
-  // enforces `blocking > 0 → verdict === "reject"`; breaking this rule
-  // would produce a schema error, not a merger bug. T-011 and T-013
-  // will tighten the approve/revise boundary with a blocking policy
-  // and category-aware rules respectively.
-  const verdict: Verdict =
-    counts.blocking > 0
-      ? "reject"
-      : counts.major > 0
-        ? "revise"
-        : "approve";
+  const { verdict, counts } = computeVerdict(findings);
 
   return {
     verdict,
