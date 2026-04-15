@@ -325,3 +325,42 @@ describe("runMergerPipeline -- blocking policy (T-011)", () => {
     expect(v.major).toBe(1);
   });
 });
+
+describe("runMergerPipeline -- tension detection (T-012)", () => {
+  it("security + performance at same file, different categories → one tension in verdict", () => {
+    const v = runMergerPipeline({
+      reviewId: RID,
+      perLens: [
+        perLens(
+          "security",
+          ok([
+            finding("major", {
+              id: "s1",
+              file: "src/auth.ts",
+              line: 10,
+              category: "auth",
+              confidence: 0.9,
+            }),
+          ]),
+        ),
+        perLens(
+          "performance",
+          ok([
+            finding("major", {
+              id: "p1",
+              file: "src/auth.ts",
+              line: 20,
+              category: "hot-path",
+              confidence: 0.9,
+            }),
+          ]),
+        ),
+      ],
+    });
+    expect(v.tensions).toHaveLength(1);
+    expect(v.tensions[0]!.category).toBe("security-vs-performance");
+    expect(v.tensions[0]!.lenses).toEqual(["security", "performance"]);
+    expect(v.major).toBe(2);
+    expect(v.verdict).toBe("revise");
+  });
+});

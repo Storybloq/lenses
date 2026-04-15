@@ -472,6 +472,19 @@ describe("TensionSchema", () => {
       }).success,
     ).toBe(false);
   });
+
+  it("rejects more than 2 lenses (a tension is a pair, not a coalition)", () => {
+    // T-012: TensionSchema.lenses uses .length(2) so a three-lens
+    // "coalition" cannot leak through the schema. That shape would need
+    // its own type.
+    expect(
+      TensionSchema.safeParse({
+        category: "auth",
+        lenses: ["security", "performance", "concurrency"],
+        summary: "s",
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe("DeferralKeySchema", () => {

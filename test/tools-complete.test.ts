@@ -394,6 +394,47 @@ describe("handleLensReviewComplete -- mergerConfig flow-through (T-011)", () => 
   });
 });
 
+describe("handleLensReviewComplete -- tension detection (T-012)", () => {
+  it("security + performance at the same file, different categories → verdict.tensions has one entry", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "performance"] },
+    });
+    const [secId, perfId] = lensIds;
+    if (!secId || !perfId) throw new Error("need security + performance");
+    const results = [
+      {
+        lensId: secId,
+        output: ok([
+          finding("major", {
+            id: "s1",
+            file: "src/auth.ts",
+            line: 10,
+            category: "auth",
+            confidence: 0.9,
+          }),
+        ]),
+      },
+      {
+        lensId: perfId,
+        output: ok([
+          finding("major", {
+            id: "p1",
+            file: "src/auth.ts",
+            line: 20,
+            category: "hot-path",
+            confidence: 0.9,
+          }),
+        ]),
+      },
+    ];
+    const { body } = await callComplete({ reviewId, results });
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.tensions).toHaveLength(1);
+    expect(verdict.tensions[0]!.category).toBe("security-vs-performance");
+    expect(verdict.tensions[0]!.lenses).toEqual(["security", "performance"]);
+  });
+});
+
 describe("handleLensReviewComplete -- sessionId coupling (T-009 baseline)", () => {
   it("sessionId in the verdict equals the input reviewId", async () => {
     const { reviewId, lensIds } = await startPlanReview({

@@ -9,11 +9,16 @@ export type Verdict = z.infer<typeof VerdictSchema>;
 /**
  * A cross-lens disagreement surfaced by the merger (see T-012). The schema
  * defines the shape; detection lives in the merger.
+ *
+ * `lenses` is fixed at length 2: a tension is by definition a pair of lenses.
+ * Using `.length(2)` (rather than `.min(2)`) pins the contract so a future
+ * caller cannot leak a 3-element "coalition" through the schema boundary --
+ * that would require its own type, not a reuse of `Tension`.
  */
 export const TensionSchema = z
   .object({
     category: z.string().min(1),
-    lenses: z.array(z.string().min(1)).min(2),
+    lenses: z.array(z.string().min(1)).length(2),
     summary: z.string(),
   })
   .strict()

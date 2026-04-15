@@ -22,6 +22,7 @@ import {
 
 import { applyBlockingPolicy } from "./blocking-policy.js";
 import { dedupeFindings } from "./dedup.js";
+import { detectTensions } from "./tension.js";
 
 export interface LensRunResult {
   readonly lensId: LensId;
@@ -37,9 +38,9 @@ export interface MergerInput {
 
 /**
  * Baseline merger. Deduplicates cross-lens findings by `(file, line,
- * category)` (T-010), counts severities over the post-dedup array, and
- * derives the verdict from severity presence alone. Tensions are always
- * `[]` until T-012 wires in detection.
+ * category)` (T-010), applies the blocking policy (T-011), detects
+ * cross-lens tensions (T-012), counts severities over the post-policy
+ * array, and derives the verdict from severity presence alone.
  *
  * `sessionId` is set to `reviewId` for T-009. T-014 will introduce a
  * distinct session cache where sessionId diverges from reviewId; the
@@ -55,6 +56,7 @@ export function runMergerPipeline(input: MergerInput): ReviewVerdict {
   // schema's count invariant must match the emitted findings.
   const deduped = dedupeFindings(input.perLens);
   const findings = applyBlockingPolicy(deduped, config);
+  const tensions = detectTensions(findings);
 
   const counts: Record<Severity, number> = {
     blocking: 0,
@@ -81,7 +83,7 @@ export function runMergerPipeline(input: MergerInput): ReviewVerdict {
   return {
     verdict,
     findings,
-    tensions: [],
+    tensions,
     blocking: counts.blocking,
     major: counts.major,
     minor: counts.minor,
