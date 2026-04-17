@@ -1,11 +1,11 @@
-# @amirshayegh/lenses
+# @storybloq/lenses
 
 Multi-lens code review MCP server — 8 specialized reviewers run in parallel, with findings deduplicated, confidence-filtered, and rolled into a single verdict.
 
 ## Installation
 
 ```sh
-npm install -g @amirshayegh/lenses
+npm install -g @storybloq/lenses
 ```
 
 ## Register with Claude Code

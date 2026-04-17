@@ -46,7 +46,7 @@ The server never calls the Claude API. Claude Code is the execution engine -- th
 - **Schema validation**: Zod
 - **Build**: tsup
 - **Test**: vitest
-- **Package**: @amirshayegh/lenses on npm
+- **Package**: @storybloq/lenses on npm
 
 ## Project Structure
 
@@ -85,7 +85,7 @@ test/
 
 ## Distribution
 
-Standalone: `npm install -g @amirshayegh/lenses && claude mcp add lenses -s user -- lenses --mcp`
+Standalone: `npm install -g @storybloq/lenses && claude mcp add lenses -s user -- lenses --mcp`
 
 Bundled: installed automatically as a dependency of `@anthropologies/claudestory` via `claudestory setup-skill`.
 
