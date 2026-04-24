@@ -8,9 +8,9 @@
   "location": [],
   "phase": null,
   "relatedTickets": [],
-  "resolution": null,
-  "resolvedDate": null,
+  "resolution": "Closed as wontfix. Independent review confirmed the comment in src/types/build-constants.d.ts is factually correct documentation of the failure mode when tsup's `define` is absent, not a misstatement about the deployed path. Triple-coverage by version-drift.test.ts (noted in the issue itself) already pins that the replacement is wired. No code change needed.",
+  "resolvedDate": "2026-04-24",
   "severity": "medium",
-  "status": "open",
+  "status": "resolved",
   "title": "[comment-accuracy] Comment in src/types/build-constants.d.ts says identifier 'will read undefined a"
 }

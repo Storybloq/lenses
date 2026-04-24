@@ -1,7 +1,10 @@
 {
   "blockedBy": [
     "T-018",
-    "T-021"
+    "T-021",
+    "T-022",
+    "T-023",
+    "T-024"
   ],
   "claimedBySession": "efc26ffb-44b6-4cb2-88d4-d837f9c697c8",
   "completedDate": null,

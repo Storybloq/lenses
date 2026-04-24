@@ -1,0 +1,21 @@
+{
+  "content": "In two-hop MCP architectures where the server constructs prompts but the caller (Claude Code) spawns subagents, parse-retry and timeout enforcement cannot live server-side — they must be expressed as protocol fields the caller honors (`nextActions[]`, `expiresAt`, `attempt` key). Writing \"retry on parse failure\" as a policy rather than a shape defers the decision to the implementer, who will pick a default that silently becomes the contract.",
+  "context": "Surfaced during the 2026-04-23 lenses evaluation (see handover 2026-04-23-01-live-test-external-review-contract-tickets.md and codex session 019dbe18-b4a8-7980-9609-bda68a3e36cb). Codex's critique #7: \"The parse-retry loop is not implementable as described unless the server persists the exact prompt payload and retry ownership model. In a two-hop system, lens_review_complete does not itself control subagent execution; after a parse failure it must either emit a new task for the caller or have a replayable task record.\" This directly shaped T-022's `nextActions[]` specification (attempt budget, resubmission model, terminal routing, expiry ownership) and T-024's `(reviewId, lensId, attempt)` idempotence key. The failure mode this prevents: two implementers reading \"retry on parse failure\" and picking incompatible defaults (one retries in-server and blocks, one doesn't retry at all, one emits a task the caller doesn't know to honor) — callers can't tell which implementation they're talking to, and the contract is inconsistent across restarts of the same server.",
+  "createdDate": "2026-04-24",
+  "id": "L-002",
+  "lastValidated": "2026-04-24",
+  "reinforcements": 0,
+  "source": "review",
+  "status": "active",
+  "supersedes": null,
+  "tags": [
+    "contract",
+    "protocol",
+    "mcp",
+    "architecture",
+    "two-hop",
+    "retry"
+  ],
+  "title": "Retry must be a cooperative protocol when the server can't execute subagents",
+  "updatedDate": "2026-04-24"
+}

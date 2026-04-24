@@ -1,0 +1,20 @@
+{
+  "content": "A new verdict field that changes how existing fields should be read (e.g., adding `deferred[]` to a schema where `findings: []` used to mean \"no concerns existed\") is a semantic break even when syntactically additive. Ship the disambiguating signal (e.g., `hadAnyFindings: boolean`) in the same PR as the new field so callers can never observe an ambiguous intermediate state. If you can't ship both at once, bump the schema version.",
+  "context": "Flagged by codex-gpt-5.4 during 2026-04-23 review of the proposed lenses verdict extension (session 019dbe18-b4a8-7980-9609-bda68a3e36cb, finding #5): \"`deferred` is not just a visibility improvement; it changes the meaning of an `approve` verdict for downstream consumers. As written, the plan makes it additive, but if callers are currently treating `findings:[]` as 'no concerns existed', this is a semantic compatibility break and the exact class of trust failure you observed in the live test.\" The live test showed this concretely: 5 real test-quality findings (confidence 0.62–0.78) were swallowed by the `.strict()` + syntheticError path, the verdict reported `approve` with `findings: []`, and a human reviewer reading only the verdict would have shipped the PR believing it was clean. Informed T-022's acceptance criterion that `hadAnyFindings`, `parseErrors[]`, `deferred[]`, and `suppressedFindingCount` all ship in the same PR — `approve + hadAnyFindings: true + findings: []` must be observably distinct from `approve + hadAnyFindings: false`.",
+  "createdDate": "2026-04-24",
+  "id": "L-003",
+  "lastValidated": "2026-04-24",
+  "reinforcements": 0,
+  "source": "review",
+  "status": "active",
+  "supersedes": null,
+  "tags": [
+    "contract",
+    "verdict",
+    "semantic-versioning",
+    "trust",
+    "mcp"
+  ],
+  "title": "Verdict fields that change how existing fields are interpreted are semantic breaks, not additions",
+  "updatedDate": "2026-04-24"
+}

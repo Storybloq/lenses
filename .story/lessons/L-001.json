@@ -1,0 +1,20 @@
+{
+  "content": "When a schema at an ingress boundary is `.strict()`, a parse failure that downgrades the payload to a `syntheticError` MUST surface the Zod issue to the caller via a dedicated response field (e.g., `parseErrors[]`). Silent swallow + filter-out-by-status downstream is indistinguishable from \"lens returned clean\" and will quietly destroy signal on any caller that submits an unknown field. Prefer `.passthrough()` at payload-level + `.strict()` at envelope-level when forward compatibility matters; always expose parse failures in the response shape.",
+  "context": "Discovered during the first end-to-end live test of the lens review system on 2026-04-23. The orchestrator (me) submitted `output` objects to `lens_review_complete` with `lensId` injected inside `output` for bookkeeping. `LensOutputSchema` at `src/schema/finding.ts:106` is `.strict()`, so the unknown `lensId` key failed `safeParse`. `complete.ts:317` routed the failure to `syntheticError(summarizeZod(res.error))` with `status: \"error\"`. `dedup.ts:43` then skipped the entry as `status !== \"ok\"`. Result: 5 real test-quality findings (confidences 0.62–0.78, all above the 0.6 floor) disappeared from the verdict with ZERO caller-visible signal — same outward shape (`findings: []`) as a clean approve. Independent review on the same day (see handover 2026-04-23) identified this as \"leak #1\" and correctly predicted the parse-failure path from code inspection, though their diagnosis only named the lens-output-is-malformed trigger; the live test showed it also fires on valid-but-over-strict caller envelopes. This trap will re-fire on any external consumer (T-016 claudestory adapter is next) until the contract surfaces parseErrors. Fix tracked as T-022 (contract redesign).",
+  "createdDate": "2026-04-23",
+  "id": "L-001",
+  "lastValidated": "2026-04-23",
+  "reinforcements": 0,
+  "source": "review",
+  "status": "active",
+  "supersedes": null,
+  "tags": [
+    "schema",
+    "zod",
+    "contract",
+    "observability",
+    "mcp"
+  ],
+  "title": ".strict() schemas at ingress boundaries must surface parse errors, not swallow them",
+  "updatedDate": "2026-04-23"
+}
