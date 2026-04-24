@@ -106,6 +106,18 @@ export const ReviewVerdictSchema = z
         message: `verdict must be 'reject' when blocking > 0 (got '${val.verdict}')`,
       });
     }
+    // Symmetric check: 'reject' requires at least one blocking finding.
+    // Unreachable via `computeVerdict` (which derives verdict from the
+    // counts) but a future merger bug or a wire-mutated payload would
+    // otherwise pass through the schema with a misleading `verdict:
+    // "reject", blocking: 0`.
+    if (val.verdict === "reject" && val.blocking === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["verdict"],
+        message: `verdict 'reject' requires blocking > 0 (got blocking=0)`,
+      });
+    }
     // T-022: suppressedFindingCount is a caller-friendly mirror of
     // deferred.length; inconsistency here is a merger bug.
     if (val.suppressedFindingCount !== val.deferred.length) {
@@ -127,6 +139,29 @@ export const ReviewVerdictSchema = z
         code: z.ZodIssueCode.custom,
         path: ["hadAnyFindings"],
         message: `hadAnyFindings=false but findings+deferred=${val.findings.length + val.deferred.length}`,
+      });
+    }
+    // Symmetric check: `hadAnyFindings === true` means at least one
+    // lens produced a finding at parse time. The pipeline routes every
+    // parsed finding to `findings[]` (kept) or `deferred[]` (dropped by
+    // confidence floor) -- `parseErrors[]` is orthogonal (findings that
+    // failed .strict() never populate output.findings, so they never
+    // contributed to `hadAnyFindings` in the first place). Therefore
+    // `hadAnyFindings=true` with both `findings[]` and `deferred[]`
+    // empty is structurally impossible. Enforced at the schema
+    // boundary so a future merger regression that silently drops
+    // findings cannot produce a misleading `hadAnyFindings: true,
+    // findings: []` -- the caller would otherwise have no signal that
+    // something went wrong.
+    if (
+      val.hadAnyFindings === true &&
+      val.findings.length === 0 &&
+      val.deferred.length === 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["hadAnyFindings"],
+        message: `hadAnyFindings=true but findings and deferred are both empty (pipeline dropped all findings without deferring them)`,
       });
     }
     // T-022: when the server is asking for retries, the caller must

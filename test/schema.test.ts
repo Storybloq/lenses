@@ -468,6 +468,42 @@ describe("ReviewVerdictSchema", () => {
     expect(result.success).toBe(false);
   });
 
+  // T-022 follow-up: symmetric L-003 check. hadAnyFindings=true with
+  // both findings and deferred empty is structurally impossible --
+  // the pipeline routes every parsed finding to one or the other.
+  it("rejects hadAnyFindings=true with both findings and deferred empty", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "approve",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: true,
+      // deferred / parseErrors / nextActions default to [] — so this
+      // payload asserts "a finding existed but is visible NOWHERE".
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // T-022 follow-up: symmetric reject-requires-blocker check.
+  it("rejects verdict='reject' with blocking=0 (symmetric to blocking>0 forces reject)", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "reject",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: false,
+    });
+    expect(result.success).toBe(false);
+  });
+
   // T-022: hadAnyFindings=false is incompatible with any finding content.
   it("rejects hadAnyFindings=false with non-empty findings", () => {
     const result = ReviewVerdictSchema.safeParse({
