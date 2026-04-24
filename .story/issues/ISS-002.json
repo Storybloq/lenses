@@ -5,12 +5,14 @@
   "discoveredDate": "2026-04-13",
   "id": "ISS-002",
   "impact": "smoke test no longer exercises main()/StdioServerTransport bootstrap path; CLI wiring regressions would not be caught",
-  "location": [],
+  "location": [
+    "test/smoke.test.ts"
+  ],
   "phase": null,
   "relatedTickets": [],
-  "resolution": null,
-  "resolvedDate": null,
+  "resolution": "test/smoke.test.ts now spawns the built `dist/cli.js` with `--mcp` over a real child process, completes the MCP initialize handshake + notifications/initialized, and verifies tools/list returns all three T-022 tools. Skipped when dist/cli.js is missing (pre-build). The test catches CLI wiring regressions end-to-end — shebang, --mcp flag parse, StdioServerTransport.connect, and listTools response shape must all work together for it to pass.",
+  "resolvedDate": "2026-04-24",
   "severity": "medium",
-  "status": "open",
+  "status": "resolved",
   "title": "[test coverage] smoke test no longer exercises main()/StdioServerTransport bootstrap path; CLI w"
 }
