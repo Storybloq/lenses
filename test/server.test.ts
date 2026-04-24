@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
 import { describe, it, expect } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -7,6 +11,17 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { createServer } from "../src/server.js";
+
+/**
+ * T-023 acceptance: the MCP-handshake version must match `package.json` so
+ * callers never observe `0.0.0` on a published build. Reading it here at test
+ * time pins the tsup/vitest `define` wiring end-to-end.
+ */
+const PKG_VERSION = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const raw = readFileSync(resolve(here, "..", "package.json"), "utf8");
+  return (JSON.parse(raw) as { version: string }).version;
+})();
 
 async function connectedPair() {
   const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
@@ -47,7 +62,7 @@ describe("MCP server skeleton", () => {
       expect(caps?.tools).toBeDefined();
       expect(client.getServerVersion()).toEqual({
         name: "lenses",
-        version: "0.0.0",
+        version: PKG_VERSION,
       });
     } finally {
       await closeQuietly(client, server);

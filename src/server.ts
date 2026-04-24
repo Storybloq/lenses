@@ -16,7 +16,7 @@ import {
   lensReviewStartDefinition,
 } from "./tools/start.js";
 
-const SERVER_INFO = { name: "lenses", version: "0.0.0" } as const;
+const SERVER_INFO = { name: "lenses", version: __LENSES_VERSION__ } as const;
 
 /**
  * Build a configured MCP Server. Tool handlers are wired here; transport is not —

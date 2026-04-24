@@ -1,0 +1,16 @@
+{
+  "components": [
+    "autonomous"
+  ],
+  "discoveredDate": "2026-04-24",
+  "id": "ISS-003",
+  "impact": "Comment in src/types/build-constants.d.ts says identifier 'will read undefined at runtime' while the declared type is `string`. Factually correct for misconfigured build but mildly confusing inside the .d.ts. Triple-covered by version-drift.test.ts (not.toBeUndefined, not.toBe '0.0.0', toBe pkg.version).",
+  "location": [],
+  "phase": null,
+  "relatedTickets": [],
+  "resolution": null,
+  "resolvedDate": null,
+  "severity": "medium",
+  "status": "open",
+  "title": "[comment-accuracy] Comment in src/types/build-constants.d.ts says identifier 'will read undefined a"
+}

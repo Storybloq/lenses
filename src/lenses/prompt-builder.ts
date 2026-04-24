@@ -16,9 +16,11 @@ import type { LensActivation, Model } from "./registry.js";
  * independent lets T-008 compose both without each test carrying irrelevant
  * fields from the other.
  *
- * Defaults mirror the lensConfig defaults documented in CLAUDE.md:
- *   findingBudget = 10, confidenceFloor = 0.6.
- * When CLAUDE.md's defaults change, update both in lockstep.
+ * Defaults (findingBudget=10, confidenceFloor=0.6) are the single source of
+ * truth here; the shared preamble renders them verbatim into every lens body.
+ * When they change, the pinned-output tests in `test/shared-preamble.test.ts`
+ * and the `PreambleConfigSchema` parse tests in `test/lens-prompt-builder.test.ts`
+ * move with the change.
  */
 export const PreambleConfigSchema = z
   .object({

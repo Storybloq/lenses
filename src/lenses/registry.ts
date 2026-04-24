@@ -24,14 +24,36 @@ export type Model = z.infer<typeof ModelSchema>;
 
 /**
  * User-facing activation config -- the subset of `lensConfig` that determines
- * which lenses fire and what opts each receives. Preamble-tuning knobs
- * (findingBudget, confidenceFloor, tokenBudgetPerLens, lensTimeout) belong to
- * T-007's preamble assembly, not here.
+ * which lenses fire, what opts each receives, and how long the caller should
+ * let each spawned agent run. `findingBudget` and `confidenceFloor` are
+ * preamble-framing knobs and live on `PreambleConfigSchema` in
+ * `src/lenses/prompt-builder.ts`.
+ *
+ * `maxLenses` caps active-lens count below the 8-lens total. Unset = no cap.
+ * The `.max(8)` upper bound matches the total lens count, so values ≥ 8
+ * behave identically to "unset" (no truncation ever fires).
+ *
+ * `lensTimeout` is what T-022 will hand to spawned agents via
+ * `agents[].expiresAt`. It is an activation-time concern (per-call, per-model)
+ * rather than a merger-time constant, so it lives here rather than on
+ * `MergerConfigSchema`. The scalar form applies to every model; the object
+ * form distinguishes opus (typically slower) from the default.
  *
  * `hotPaths` mirrors PerformanceLensOptsSchema byte-for-byte via the three
  * re-exported constants so a malformed hotPath fails at this trust boundary,
  * not deferred to `renderBody` at T-007 prompt-render time.
  */
+export const LensTimeoutSchema = z.union([
+  z.number().int().positive(),
+  z
+    .object({
+      default: z.number().int().positive(),
+      opus: z.number().int().positive(),
+    })
+    .strict(),
+]);
+export type LensTimeout = z.infer<typeof LensTimeoutSchema>;
+
 export const LensConfigSchema = z
   .object({
     lenses: z
@@ -39,6 +61,7 @@ export const LensConfigSchema = z
       .optional(),
     maxLenses: z.number().int().min(1).max(8).optional(),
     lensModels: z.record(LensIdSchema, ModelSchema).optional(),
+    lensTimeout: LensTimeoutSchema.optional(),
     hotPaths: z
       .array(
         z
@@ -53,6 +76,35 @@ export const LensConfigSchema = z
   })
   .strict();
 export type LensConfig = z.infer<typeof LensConfigSchema>;
+
+/**
+ * Default per-model timeouts in milliseconds. Opus lenses (security,
+ * concurrency) get 2x the default budget because they reason slower. T-022
+ * sets `agents[].expiresAt = now() + resolveLensTimeoutMs(model, config)`
+ * at hop-1 and rejects hop-2 resubmissions past that wall-clock deadline.
+ */
+export const DEFAULT_LENS_TIMEOUT_MS = {
+  default: 60_000,
+  opus: 120_000,
+} as const;
+
+/**
+ * Resolve the effective timeout for a lens given its model and the caller's
+ * `lensConfig`. Pure; same input always yields the same output.
+ */
+export function resolveLensTimeoutMs(
+  model: Model,
+  config: LensConfig | undefined,
+): number {
+  const override = config?.lensTimeout;
+  if (override === undefined) {
+    return model === "opus"
+      ? DEFAULT_LENS_TIMEOUT_MS.opus
+      : DEFAULT_LENS_TIMEOUT_MS.default;
+  }
+  if (typeof override === "number") return override;
+  return model === "opus" ? override.opus : override.default;
+}
 
 export interface LensActivation {
   readonly lensId: LensId;
