@@ -1,0 +1,20 @@
+{
+  "content": "Do NOT include `Co-Authored-By: Claude ...` trailers in commit messages on this repo. The project convention is to keep commit history attribution-free (verified 2026-04-24: origin/main was rewritten to strip all such trailers; subsequent history has been kept clean). Claude Code's default commit template adds this trailer automatically — override it on every commit. If you notice trailers leaking in during autonomous work, strip them before push (`git filter-branch --msg-filter 'grep -v \"^Co-Authored-By: Claude\" || true' <range>`), not after.</content>",
+  "context": "Discovered 2026-04-24 during the post-auto-session publish prep. Local clone had 29 unpushed commits (T-022/T-023/T-024/ISS-002 work + .story artifacts + version bump); `git push` was rejected because origin/main had been rewritten. Root-cause investigation found identical trees but different hashes on 22 parallel-path commits going back to the common ancestor `8fcbf6c`. Byte-diff of the first-diverged commit (`f4228e19` local vs `aac12926` remote) showed one difference: the remote version had `Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>` stripped from the message. That cascade-rewrote every downstream commit's hash. User confirmed the rewrite was intentional (Option C: force-push local then run the same strip locally), so this is the project's durable convention, not a one-off cleanup. `git filter-branch --msg-filter 'grep -v \"^Co-Authored-By: Claude\" || true' main` rewrote 33 commits, tests still green (575/575), force-pushed cleanly to `d47e3c4`. Backup branch `backup/pre-strip-coauthor` kept locally. Future autonomous sessions must configure their commit template to skip the Claude trailer, or this history-rewrite dance happens every publish.",
+  "createdDate": "2026-04-24",
+  "id": "L-004",
+  "lastValidated": "2026-04-24",
+  "reinforcements": 0,
+  "source": "correction",
+  "status": "active",
+  "supersedes": null,
+  "tags": [
+    "git",
+    "commit-message",
+    "convention",
+    "attribution",
+    "policy"
+  ],
+  "title": "This project strips Co-Authored-By: Claude trailers from commit history",
+  "updatedDate": "2026-04-24"
+}
