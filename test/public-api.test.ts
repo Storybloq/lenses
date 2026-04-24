@@ -94,9 +94,20 @@ describe("public API re-exports (src/index.ts)", () => {
       minor: 0,
       suggestion: 0,
       sessionId: "smoke",
+      // T-022: hadAnyFindings is required (L-003 disambiguation).
+      // parseErrors/deferred/suppressedFindingCount/nextActions default
+      // to [] / 0 via Zod so they don't need to appear in `minimal`.
+      hadAnyFindings: false,
     };
     const parsed = ReviewVerdictSchema.parse(minimal);
-    expect(parsed).toEqual(minimal);
+    // Defaults materialize post-parse, so check the provided fields
+    // round-trip and the defaults are present.
+    expect(parsed.verdict).toBe("approve");
+    expect(parsed.hadAnyFindings).toBe(false);
+    expect(parsed.parseErrors).toEqual([]);
+    expect(parsed.deferred).toEqual([]);
+    expect(parsed.suppressedFindingCount).toBe(0);
+    expect(parsed.nextActions).toEqual([]);
   });
 
   it("DeferralKeySchema parses and enforces file/line correlation", () => {

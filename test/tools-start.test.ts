@@ -7,7 +7,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { hashLensPrompt, writeLensCache } from "../src/cache/lens-cache.js";
+import { writeLensCache } from "../src/cache/lens-cache.js";
 import type { LensId } from "../src/lenses/prompts/index.js";
 import { createServer } from "../src/server.js";
 import { _resetForTests, getReview } from "../src/state/review-state.js";
@@ -46,6 +46,22 @@ afterEach(() => {
 
 const UUID_V4_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * T-022: hop-1 response no longer carries prompt text — only promptHash +
+ * expiresAt. Tests that assert on prompt content fetch the prompt from the
+ * in-process state store (`getReview(...).prompts`). Equivalent to the
+ * `lens_review_get_prompt` tool call but avoids the wire overhead in unit
+ * tests. End-to-end coverage of `lens_review_get_prompt` lives in
+ * `test/tools-get-prompt.test.ts`.
+ */
+function promptFor(reviewId: string, lensId: string): string {
+  const s = getReview(reviewId);
+  if (!s) throw new Error(`no review for ${reviewId}`);
+  const p = s.prompts.get(lensId as LensId);
+  if (p === undefined) throw new Error(`no prompt for ${lensId}`);
+  return p;
+}
 
 function planReviewArgs(overrides: Record<string, unknown> = {}) {
   return {
@@ -203,7 +219,9 @@ describe("handleLensReviewStart -- end-to-end happy path", () => {
     const { body } = await callStart(planReviewArgs());
     const parsed = StartToolOutputSchema.parse(body);
     for (const a of parsed.agents) {
-      expect(a.prompt.startsWith("## Safety")).toBe(true);
+      expect(promptFor(parsed.reviewId, a.id).startsWith("## Safety")).toBe(
+        true,
+      );
     }
   });
 
@@ -243,7 +261,7 @@ describe("handleLensReviewStart -- config propagation", () => {
     const parsed = StartToolOutputSchema.parse(body);
     expect(parsed.agents).toHaveLength(1);
     expect(parsed.agents[0]?.id).toBe("security");
-    expect(parsed.agents[0]?.prompt).toContain("Lens: security");
+    expect(promptFor(parsed.reviewId, "security")).toContain("Lens: security");
   });
 
   it("lensConfig.lensModels overrides the default model for a lens", async () => {
@@ -267,7 +285,9 @@ describe("handleLensReviewStart -- config propagation", () => {
       }),
     );
     const parsed = StartToolOutputSchema.parse(body);
-    expect(parsed.agents[0]?.prompt).toContain("at most 3 findings");
+    expect(promptFor(parsed.reviewId, "security")).toContain(
+      "at most 3 findings",
+    );
   });
 
   it("projectContext.projectRules appears in every prompt", async () => {
@@ -279,8 +299,9 @@ describe("handleLensReviewStart -- config propagation", () => {
     );
     const parsed = StartToolOutputSchema.parse(body);
     for (const a of parsed.agents) {
-      expect(a.prompt).toContain('<untrusted-context name="projectRules">');
-      expect(a.prompt).toContain("PR_X");
+      const prompt = promptFor(parsed.reviewId, a.id);
+      expect(prompt).toContain('<untrusted-context name="projectRules">');
+      expect(prompt).toContain("PR_X");
     }
   });
 
@@ -301,9 +322,12 @@ describe("handleLensReviewStart -- config propagation", () => {
     const parsed = StartToolOutputSchema.parse(body);
     const sec = parsed.agents.find((a) => a.id === "security");
     const clean = parsed.agents.find((a) => a.id === "clean-code");
-    expect(sec?.prompt).toContain("## Known prior deferrals");
-    expect(sec?.prompt).toContain('category="injection"');
-    expect(clean?.prompt).not.toContain("## Known prior deferrals");
+    if (!sec || !clean) throw new Error();
+    const secPrompt = promptFor(parsed.reviewId, sec.id);
+    const cleanPrompt = promptFor(parsed.reviewId, clean.id);
+    expect(secPrompt).toContain("## Known prior deferrals");
+    expect(secPrompt).toContain('category="injection"');
+    expect(cleanPrompt).not.toContain("## Known prior deferrals");
   });
 
   it("lensConfig.maxLenses caps the agent count and drops the tail", async () => {
@@ -345,7 +369,10 @@ describe("handleLensReviewStart -- T-015 cache resolution (§8b)", () => {
     const parsed = StartToolOutputSchema.parse(body);
     const hashes = new Map<LensId, string>();
     for (const agent of parsed.agents) {
-      hashes.set(agent.id, hashLensPrompt(agent.prompt));
+      // T-022: hop-1 now ships promptHash directly. Use it as-is
+      // instead of recomputing from `agent.prompt` (which no longer
+      // exists on the wire).
+      hashes.set(agent.id, agent.promptHash);
     }
     for (const lensId of lensIdsToSeed) {
       const promptHash = hashes.get(lensId);

@@ -13,6 +13,7 @@ import {
   LensConfigSchema,
   LensIdSchema,
   ModelSchema,
+  resolveLensTimeoutMs,
 } from "../lenses/registry.js";
 import type { LensId } from "../lenses/prompts/index.js";
 import {
@@ -73,9 +74,15 @@ export const StartToolInputSchema = z.discriminatedUnion("stage", [
 export type StartToolInput = z.infer<typeof StartToolInputSchema>;
 
 /**
- * Wire response shape. Note `id` (wire) vs `lensId` (internal) -- the handler
- * renames once at serialization so internal code keeps the more descriptive
- * field name everywhere else.
+ * Wire response shape (T-022 refs-not-prompts). The agent receives
+ * `promptHash` + `expiresAt` per spawned lens and fetches the full prompt
+ * via `lens_review_get_prompt` just before spawning its subagent. Collapses
+ * the hop-1 payload from ~68KB (inline prompts × 6 lenses) to <5KB for a
+ * typical activation -- no more parser-subagent needed to read hop-1.
+ *
+ * `id` (wire) vs `lensId` (internal) -- the handler renames once at
+ * serialization so internal code keeps the more descriptive field name
+ * everywhere else.
  */
 export const StartToolOutputSchema = z
   .object({
@@ -85,7 +92,8 @@ export const StartToolOutputSchema = z
         .object({
           id: LensIdSchema,
           model: ModelSchema,
-          prompt: z.string().min(1),
+          promptHash: z.string().min(1),
+          expiresAt: z.string().datetime({ offset: true }),
         })
         .strict(),
     ),
@@ -104,8 +112,9 @@ export type StartToolOutput = z.infer<typeof StartToolOutputSchema>;
 export const lensReviewStartDefinition = {
   name: LENS_REVIEW_START_NAME,
   description:
-    "Begin a multi-lens review. Returns prompts for the agent to spawn as subagents, " +
-    "plus any cached lens findings. Hop 1 of 2.",
+    "Begin a multi-lens review. Returns a reviewId and a list of agents (each " +
+    "with promptHash + expiresAt); fetch the actual prompt for each agent via " +
+    "lens_review_get_prompt before spawning. Hop 1 of 2+.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -145,27 +154,7 @@ function tryCacheRead(
   }
 }
 
-/**
- * Build the Hop-1 response: activate → assemble → resolve-cache →
- * wire-rename. Pure wrt its inputs except for the reviewId generated
- * via `crypto.randomUUID()` and the best-effort disk reads done by
- * `readLensCache`. A cache read throw is swallowed per RULES.md §4 --
- * the lens is treated as a miss and re-spawned.
- *
- * T-015 pipeline: for each activated lens, compute a stable prompt
- * hash, consult the disk cache, and split into `agents` (miss -- the
- * agent must spawn) and `cached` (hit -- the agent skips). Cached
- * entries AND the full `promptHashes` map land on the ReviewSession
- * so hop-2 can re-inject findings and write fresh entries without
- * a second disk read.
- */
 function buildResponse(parsed: StartToolInput): StartToolOutput {
-  // `StartToolInputSchema` is a superset of `StartParamsSchema` (it adds
-  // lensConfig, preambleConfig, projectContext on top of sharedStartShape +
-  // stage + changedFiles). Destructuring the three config fields off leaves
-  // exactly the StartParams residue. Using spread (not field-by-field
-  // reconstruction) so future additions to `sharedStartShape` propagate
-  // automatically without a silent drop here.
   const { lensConfig, preambleConfig, projectContext, ...startParamsLike } =
     parsed;
   const startParams: StartParams = startParamsLike as StartParams;
@@ -183,13 +172,7 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
     ...(projectContext !== undefined ? { projectContext } : {}),
   });
 
-  // T-015 cache resolution. Split each activated lens into hit (goes
-  // to `cachedEntries`) or miss (stays in `spawnedAgents`).
-  // `promptHashes` tracks the hash for EVERY activated lens, cached
-  // or not, so hop-2 can write fresh results under the right key.
-  // `expectedLensIds` is the FULL activation list (hits + misses):
-  // the state machine enforces coverage across the union, and cached
-  // lenses are covered by `cachedResults`.
+  // T-015 cache resolution.
   const promptHashes = new Map<LensId, string>();
   const cachedEntries = new Map<LensId, CachedLensEntry>();
   const cachedWire: Array<{ id: LensId; findings: LensFinding[] }> = [];
@@ -206,14 +189,39 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
     }
   }
 
-  // Track the review in the T-020 state machine BEFORE returning so the
-  // complementary `lens_review_complete` handler (T-009) can enforce
-  // reviewId validity, lens coverage, and one-shot completion. In T-014
-  // we also resolve (or mint) the cross-round `sessionId` here so the
-  // complete-time path can build a `RoundRecord` without reparsing the
-  // start-time envelope. T-015 additionally stashes the cached entries
-  // and prompt-hash map so hop-2 can rehydrate findings and update the
-  // cache without re-reading the prompts.
+  // T-022: store the full prompt text + compute expiresAt per lens.
+  // The prompt map drives `lens_review_get_prompt`; the expiresAt map
+  // drives the retry-expiry check in `lens_review_complete`.
+  const prompts = new Map<LensId, string>();
+  const perLensExpiresAt = new Map<LensId, number>();
+  const nowMs = Date.now();
+  const wireAgents: Array<{
+    id: LensId;
+    model: "opus" | "sonnet";
+    promptHash: string;
+    expiresAt: string;
+  }> = [];
+  for (const agent of spawnedAgents) {
+    prompts.set(agent.lensId, agent.prompt);
+    const expiresMs =
+      nowMs + resolveLensTimeoutMs(agent.model, lensConfig);
+    perLensExpiresAt.set(agent.lensId, expiresMs);
+    const hash = promptHashes.get(agent.lensId);
+    // Invariant: every spawned agent hashed its prompt above, so `hash`
+    // is always defined here. Defensive narrowing for the type system.
+    if (hash === undefined) {
+      throw new Error(
+        `lens_review_start: missing promptHash for ${agent.lensId}`,
+      );
+    }
+    wireAgents.push({
+      id: agent.lensId,
+      model: agent.model,
+      promptHash: hash,
+      expiresAt: new Date(expiresMs).toISOString(),
+    });
+  }
+
   const reviewId = randomUUID();
   const sessionId = parsed.sessionId ?? randomUUID();
   registerReview({
@@ -225,15 +233,13 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
     priorDeferrals: parsed.priorDeferrals,
     cachedResults: cachedEntries,
     promptHashes,
+    prompts,
+    perLensExpiresAt,
   });
 
   return {
     reviewId,
-    agents: spawnedAgents.map(({ lensId, model, prompt }) => ({
-      id: lensId,
-      model,
-      prompt,
-    })),
+    agents: wireAgents,
     cached: cachedWire,
   };
 }
@@ -255,8 +261,6 @@ export async function handleLensReviewStart(
       content: [{ type: "text", text: JSON.stringify(response) }],
     };
   } catch (err) {
-    // Return only the human-readable summary -- never leak Error.stack
-    // through the MCP wire.
     const message =
       err instanceof z.ZodError
         ? `lens_review_start: invalid arguments: ${err.issues

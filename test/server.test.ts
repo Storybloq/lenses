@@ -77,7 +77,11 @@ describe("MCP server skeleton", () => {
         ListToolsResultSchema,
       );
       const names = result.tools.map((t) => t.name).sort();
-      expect(names).toEqual(["lens_review_complete", "lens_review_start"]);
+      expect(names).toEqual([
+        "lens_review_complete",
+        "lens_review_get_prompt",
+        "lens_review_start",
+      ]);
       for (const tool of result.tools) {
         expect(typeof tool.description).toBe("string");
         expect(tool.inputSchema).toMatchObject({ type: "object" });

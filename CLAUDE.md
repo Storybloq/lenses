@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An MCP server that runs 8 specialized code reviewers in parallel and returns a structured verdict. Two tool calls: `lens_review_start` (returns prompts for the agent to spawn) and `lens_review_complete` (takes results, returns verdict). The agent spawns subagents -- the server handles everything else: lens selection, prompt construction, deduplication, confidence filtering, blocking policy, tension resolution, and verdict computation.
+An MCP server that runs 8 specialized code reviewers in parallel and returns a structured verdict. Three tool calls: `lens_review_start` (returns agent refs — promptHash + expiresAt — plus any cached findings), `lens_review_get_prompt` (fetches one lens's full prompt, called once per spawn), and `lens_review_complete` (takes results, returns verdict with rich envelope including parseErrors / deferred / nextActions). The agent spawns subagents -- the server handles everything else: lens selection, prompt construction, deduplication, confidence filtering, blocking policy, tension resolution, verdict computation, and cooperative retry protocol.
 
 ## Why This Exists
 
@@ -10,17 +10,24 @@ The previous lens review system required the AI agent to orchestrate 7 steps man
 
 ## Architecture
 
-### Two-Hop Flow
+### Two-Hop+ Flow
 
 **Hop 1: `lens_review_start`**
 - Input: stage (PLAN_REVIEW or CODE_REVIEW), artifact (plan text or diff), changed files, config
-- Server: selects active lenses, builds complete self-contained prompts (never truncated), decides model per lens
-- Output: `{ reviewId, agents: [{ id, model, prompt }], cached: [{ id, findings }] }`
+- Server: selects active lenses, builds complete self-contained prompts (never truncated), decides model per lens, computes per-lens `expiresAt` from `lensTimeout`
+- Output: `{ reviewId, agents: [{ id, model, promptHash, expiresAt }], cached: [{ id, findings }] }` — refs, not prompts, so the hop-1 payload stays small (<5KB for 6 lenses)
 
-**Hop 2: `lens_review_complete`**
-- Input: reviewId, raw JSON output from each spawned agent
-- Server: validates (Zod), deduplicates, filters by confidence, applies blocking policy, resolves tensions, computes verdict
-- Output: `{ verdict, findings, tensions, blocking, major, minor, suggestions, sessionId }`
+**Hop 1.5: `lens_review_get_prompt`**
+- Input: `{ reviewId, lensId }`
+- Server: returns the full activation prompt for that lens
+- Output: `{ prompt }`. Stateless — same input always yields the same output for the review's lifetime.
+
+**Hop 2+: `lens_review_complete`**
+- Input: `reviewId`, per-lens outputs with optional `attempt` (default 1)
+- Server: validates envelopes with `.passthrough()` (unknown keys ignored), validates per-finding with `.strict()` (hallucination rejected and surfaced as `parseErrors[]`), deduplicates, filters by confidence (with dropped findings surfaced in `deferred[]`), applies blocking policy, resolves tensions, computes verdict. Emits `nextActions[]` for retryable failures while attempts remain; rejects stale or non-contiguous attempts.
+- Output: `{ verdict, findings, tensions, blocking, major, minor, suggestions, sessionId, parseErrors, deferred, suppressedFindingCount, hadAnyFindings, nextActions }`
+
+The caller honors the cooperative retry protocol: when `nextActions[]` is non-empty, re-spawn the named lenses with `retryPrompt` and resubmit via `lens_review_complete` with `attempt: N+1`. `max_attempts` defaults to 2.
 
 ### 8 Lenses
 
@@ -54,8 +61,9 @@ The server never calls the Claude API. Claude Code is the execution engine -- th
 src/
   server.ts              -- MCP server entry point
   tools/
-    start.ts             -- lens_review_start tool
-    complete.ts          -- lens_review_complete tool
+    start.ts             -- lens_review_start tool (hop 1: refs + expiresAt)
+    get-prompt.ts        -- lens_review_get_prompt tool (hop 1.5: prompt fetch)
+    complete.ts          -- lens_review_complete tool (hop 2+: verdict + retry)
   lenses/
     registry.ts          -- lens activation logic (file types, stage, config)
     prompts/             -- complete prompt templates (embedded in code)

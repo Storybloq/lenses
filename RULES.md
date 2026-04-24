@@ -23,7 +23,10 @@
 
 ## 4. MCP Server
 
-- Two tools only: `lens_review_start` and `lens_review_complete`
+- Three tools: `lens_review_start`, `lens_review_get_prompt`, `lens_review_complete`
+  - `lens_review_start` (hop 1) returns `{reviewId, agents: [{id, model, promptHash, expiresAt}], cached: [{id, findings}]}`. Refs, not prompts — keeps the hop-1 payload small.
+  - `lens_review_get_prompt` fetches the full prompt for one lens in an active review. Called once per spawned agent. Stateless per (reviewId, lensId).
+  - `lens_review_complete` (hop 2+) accepts per-lens outputs with optional `attempt` for retry. Returns a rich verdict envelope including `parseErrors[]`, `deferred[]`, `hadAnyFindings`, and `nextActions[]` for the cooperative retry protocol.
 - No side effects beyond session cache files (temp directory)
 - Stateless between calls except session cache (keyed by reviewId)
 - Graceful degradation: if cache is unavailable, skip caching, don't fail

@@ -95,6 +95,14 @@ export type MergedFinding = z.infer<typeof MergedFindingSchema>;
  * One lens run's payload. The lens's identity is carried on the envelope
  * (`CompleteParams.results[].lensId`), not here -- a single source of truth
  * avoids reconciliation logic in T-009.
+ *
+ * T-022: envelope is `.passthrough()` (was `.strict()`). Unknown bookkeeping
+ * fields on the envelope (e.g., an orchestrator annotating `lensId` inside the
+ * output for its own tracking) must NOT cause the whole lens payload to parse
+ * as a syntheticError and lose all its findings -- the 2026-04-23 live test
+ * hit exactly that. `LensFindingSchema` keeps `.strict()` so LLM hallucination
+ * on per-finding shape is still rejected; parse errors there surface via
+ * `ReviewVerdict.parseErrors[]` rather than being silently swallowed.
  */
 export const LensOutputSchema = z
   .object({
@@ -103,7 +111,7 @@ export const LensOutputSchema = z
     error: z.string().nullable(),
     notes: z.string().nullable(),
   })
-  .strict()
+  .passthrough()
   .superRefine((val, ctx) => {
     if (val.status === "error") {
       if (val.error === null || val.error.length === 0) {

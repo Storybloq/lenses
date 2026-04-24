@@ -209,13 +209,45 @@ describe("LensOutputSchema", () => {
     ).toBe(false);
   });
 
-  it("rejects unknown keys (strict)", () => {
+  // T-022: envelope is .passthrough() so unknown bookkeeping fields
+  // (e.g., an orchestrator injecting `lensId` inside output for its own
+  // tracking) no longer downgrade the whole lens payload to a
+  // syntheticError. Live-test regression pin -- the 2026-04-23 session
+  // lost 5 valid findings exactly this way when the envelope was
+  // `.strict()`.
+  it("accepts unknown envelope keys (.passthrough, T-022)", () => {
     const result = LensOutputSchema.safeParse({
       status: "ok",
       findings: [],
       error: null,
       notes: null,
       extra: 1,
+      lensId: "test-quality",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  // Findings remain `.strict()` -- LLM hallucination on per-finding
+  // shape (invented fields, wrong types) is a parseError surface, not
+  // a silent-pass surface.
+  it("still rejects unknown keys INSIDE a finding (findings stay strict)", () => {
+    const result = LensOutputSchema.safeParse({
+      status: "ok",
+      findings: [
+        {
+          id: "f1",
+          severity: "minor",
+          category: "cat",
+          file: "a.ts",
+          line: 10,
+          description: "d",
+          suggestion: "s",
+          confidence: 0.9,
+          extra: "invented field",
+        },
+      ],
+      error: null,
+      notes: null,
     });
     expect(result.success).toBe(false);
   });
@@ -294,6 +326,7 @@ describe("ReviewVerdictSchema", () => {
       minor: 2,
       suggestion: 0,
       sessionId: "review-1",
+      hadAnyFindings: true,
     });
     expect(result.success).toBe(true);
   });
@@ -392,6 +425,110 @@ describe("ReviewVerdictSchema", () => {
       minor: 0,
       suggestion: 0,
       sessionId: "r1",
+      hadAnyFindings: true,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  // T-022: hadAnyFindings is required (L-003 disambiguation).
+  it("rejects a verdict missing the hadAnyFindings field", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "approve",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // T-022: deferred.length must equal suppressedFindingCount.
+  it("rejects suppressedFindingCount that does not match deferred.length", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "approve",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: true,
+      deferred: [
+        {
+          finding: merged({ severity: "minor" }),
+          reason: "below_confidence_floor",
+        },
+      ],
+      suppressedFindingCount: 0,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // T-022: hadAnyFindings=false is incompatible with any finding content.
+  it("rejects hadAnyFindings=false with non-empty findings", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "revise",
+      findings: [merged({ severity: "minor" })],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 1,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: false,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // T-022: nextActions non-empty with verdict=approve is forbidden
+  // (retries pending; caller must not see "approve").
+  it("rejects verdict=approve when nextActions is non-empty", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "approve",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: false,
+      nextActions: [
+        {
+          lensId: "security",
+          retryPrompt: "prompt",
+          attempt: 2,
+          expiresAt: "2026-04-24T01:33:47.000Z",
+        },
+      ],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // T-022: verdict=revise WITH nextActions is permitted
+  it("accepts verdict=revise with non-empty nextActions", () => {
+    const result = ReviewVerdictSchema.safeParse({
+      verdict: "revise",
+      findings: [],
+      tensions: [],
+      blocking: 0,
+      major: 0,
+      minor: 0,
+      suggestion: 0,
+      sessionId: "r1",
+      hadAnyFindings: false,
+      nextActions: [
+        {
+          lensId: "security",
+          retryPrompt: "prompt",
+          attempt: 2,
+          expiresAt: "2026-04-24T01:33:47.000Z",
+        },
+      ],
     });
     expect(result.success).toBe(true);
   });

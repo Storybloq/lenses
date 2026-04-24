@@ -1,11 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { LensId } from "../src/lenses/prompts/index.js";
+import type { LensOutput } from "../src/schema/index.js";
 import {
   _resetForTests,
+  applyCompletion,
   getReview,
   registerReview,
-  validateAndComplete,
+  type SubmittedResult,
 } from "../src/state/review-state.js";
 
 const RID = "11111111-1111-4111-8111-111111111111";
@@ -33,6 +35,29 @@ function register(
     priorDeferrals: [],
     ...overrides,
   });
+}
+
+/**
+ * T-022 helper: build a SubmittedResult for a lens with a clean `ok`
+ * payload. Tests that need a specific `status: "error"` / findings list
+ * override via the second arg.
+ */
+function ok(
+  lensId: LensId,
+  attempt = 1,
+  overrides: Partial<LensOutput> = {},
+): SubmittedResult {
+  return {
+    lensId,
+    attempt,
+    output: {
+      status: "ok",
+      findings: [],
+      error: null,
+      notes: null,
+      ...overrides,
+    } as LensOutput,
+  };
 }
 
 beforeEach(() => {
@@ -88,6 +113,18 @@ describe("registerReview", () => {
     expect(s.priorDeferrals).toHaveLength(1);
     expect(s.priorDeferrals[0]?.lensId).toBe("security");
   });
+
+  // T-022: the new fields (prompts, perLensExpiresAt) default to empty
+  // maps when registerReview is called without them.
+  it("defaults new T-022 maps to empty when not provided", () => {
+    register();
+    const s = getReview(RID);
+    if (!s) throw new Error();
+    expect(s.prompts.size).toBe(0);
+    expect(s.perLensExpiresAt.size).toBe(0);
+    expect(s.perLensAttempts.size).toBe(0);
+    expect(s.perLensLatestOutput.size).toBe(0);
+  });
 });
 
 describe("getReview", () => {
@@ -107,11 +144,12 @@ describe("getReview", () => {
   });
 });
 
-describe("validateAndComplete", () => {
+describe("applyCompletion", () => {
   it("rejects an unknown reviewId without mutating state", () => {
-    const v = validateAndComplete({
+    const v = applyCompletion({
       reviewId: "unknown-id",
-      providedLensIds: LENSES,
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
     });
     expect(v.ok).toBe(false);
     if (v.ok) throw new Error();
@@ -119,27 +157,39 @@ describe("validateAndComplete", () => {
     expect(getReview("unknown-id")).toBeUndefined();
   });
 
-  it("transitions started -> complete on an exact-match submission", () => {
+  it("transitions started -> complete on finalize=true exact match", () => {
     register();
-    const v = validateAndComplete({ reviewId: RID, providedLensIds: LENSES });
+    const v = applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
+    });
     expect(v.ok).toBe(true);
     if (!v.ok) throw new Error();
     expect(v.session.status).toBe("complete");
     expect(getReview(RID)?.status).toBe("complete");
+    expect(v.session.perLensAttempts.get("security")).toBe(1);
   });
 
-  it("accepts a strict superset (extras ignored) as a successful transition", () => {
+  it("transitions started -> awaiting_retry on finalize=false", () => {
     register();
-    const extras: readonly LensId[] = [...LENSES, "accessibility"];
-    const v = validateAndComplete({ reviewId: RID, providedLensIds: extras });
+    const v = applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: false,
+    });
     expect(v.ok).toBe(true);
-    expect(getReview(RID)?.status).toBe("complete");
+    if (!v.ok) throw new Error();
+    expect(v.session.status).toBe("awaiting_retry");
   });
 
-  it("rejects a submission missing a lens and leaves state at started", () => {
+  it("rejects a first submission missing a lens (missing_lenses)", () => {
     register();
-    const partial: readonly LensId[] = ["security", "clean-code"];
-    const v = validateAndComplete({ reviewId: RID, providedLensIds: partial });
+    const v = applyCompletion({
+      reviewId: RID,
+      results: [ok("security"), ok("clean-code")],
+      finalize: true,
+    });
     expect(v.ok).toBe(false);
     if (v.ok) throw new Error();
     expect(v.code).toBe("missing_lenses");
@@ -148,24 +198,130 @@ describe("validateAndComplete", () => {
     expect(getReview(RID)?.status).toBe("started");
   });
 
-  it("rejects double-complete with already_complete and preserves complete status", () => {
+  it("rejects a double submission of the same attempt as stale_attempt", () => {
     register();
-    const first = validateAndComplete({ reviewId: RID, providedLensIds: LENSES });
+    const first = applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: false,
+    });
     expect(first.ok).toBe(true);
-    const second = validateAndComplete({ reviewId: RID, providedLensIds: LENSES });
+    const dup = applyCompletion({
+      reviewId: RID,
+      results: [ok("security", 1)],
+      finalize: false,
+    });
+    expect(dup.ok).toBe(false);
+    if (dup.ok) throw new Error();
+    expect(dup.code).toBe("stale_attempt");
+    if (dup.code !== "stale_attempt") throw new Error();
+    expect(dup.highestSeen).toBe(1);
+    expect(dup.submittedAttempt).toBe(1);
+  });
+
+  it("accepts an attempt=2 retry for a lens with highest=1", () => {
+    register();
+    applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: false,
+    });
+    const retry = applyCompletion({
+      reviewId: RID,
+      results: [ok("security", 2)],
+      finalize: true,
+    });
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) throw new Error();
+    expect(retry.session.status).toBe("complete");
+    expect(retry.session.perLensAttempts.get("security")).toBe(2);
+  });
+
+  it("rejects a non-contiguous attempt (skip from 1 to 3)", () => {
+    register();
+    applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: false,
+    });
+    const skip = applyCompletion({
+      reviewId: RID,
+      results: [ok("security", 3)],
+      finalize: true,
+    });
+    expect(skip.ok).toBe(false);
+    if (skip.ok) throw new Error();
+    expect(skip.code).toBe("non_contiguous_attempt");
+    if (skip.code !== "non_contiguous_attempt") throw new Error();
+    expect(skip.expected).toBe(2);
+    expect(skip.submittedAttempt).toBe(3);
+  });
+
+  it("rejects a submission past expiresAt with review_expired", () => {
+    const past = Date.now() - 1000;
+    register({
+      perLensExpiresAt: new Map<LensId, number>([["security", past]]),
+    });
+    const v = applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
+    });
+    expect(v.ok).toBe(false);
+    if (v.ok) throw new Error();
+    expect(v.code).toBe("review_expired");
+    if (v.code !== "review_expired") throw new Error();
+    expect(v.lensId).toBe("security");
+  });
+
+  it("rejects a double-complete with already_complete", () => {
+    register();
+    const first = applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
+    });
+    expect(first.ok).toBe(true);
+    const second = applyCompletion({
+      reviewId: RID,
+      results: [ok("security", 2)],
+      finalize: true,
+    });
     expect(second.ok).toBe(false);
     if (second.ok) throw new Error();
     expect(second.code).toBe("already_complete");
-    expect(getReview(RID)?.status).toBe("complete");
   });
 
-  it("preserves the immutable-record invariant: prior getReview references observe the old status", () => {
+  it("preserves the immutable-record invariant across transitions", () => {
     register();
     const snapshot = getReview(RID);
     expect(snapshot?.status).toBe("started");
-    validateAndComplete({ reviewId: RID, providedLensIds: LENSES });
+    applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
+    });
     expect(snapshot?.status).toBe("started");
     expect(getReview(RID)?.status).toBe("complete");
+  });
+
+  it("rejects the entire batch if any entry fails validation (no half-apply)", () => {
+    register();
+    applyCompletion({
+      reviewId: RID,
+      results: LENSES.map((l) => ok(l)),
+      finalize: false,
+    });
+    // Mixed batch: security at stale attempt, clean-code at valid
+    // attempt. The whole batch must be rejected.
+    const mixed = applyCompletion({
+      reviewId: RID,
+      results: [ok("security", 1), ok("clean-code", 2)],
+      finalize: true,
+    });
+    expect(mixed.ok).toBe(false);
+    // clean-code should NOT have advanced.
+    expect(getReview(RID)?.perLensAttempts.get("clean-code")).toBe(1);
   });
 });
 
@@ -176,7 +332,7 @@ describe("validateAndComplete", () => {
  * relaxed union semantics at the unit level (plan §8b') instead of
  * relying solely on the integration coverage in tools-complete.test.
  */
-describe("validateAndComplete with T-015 cachedResults", () => {
+describe("applyCompletion with T-015 cachedResults", () => {
   it("providedLensIds partial but cachedLensIds covers the gap → ok", () => {
     register({
       cachedResults: new Map([
@@ -186,9 +342,10 @@ describe("validateAndComplete with T-015 cachedResults", () => {
         ],
       ]),
     });
-    const v = validateAndComplete({
+    const v = applyCompletion({
       reviewId: RID,
-      providedLensIds: ["security", "clean-code"],
+      results: [ok("security"), ok("clean-code")],
+      finalize: true,
     });
     expect(v.ok).toBe(true);
     if (!v.ok) throw new Error();
@@ -204,18 +361,16 @@ describe("validateAndComplete with T-015 cachedResults", () => {
         ],
       ]),
     });
-    const v = validateAndComplete({
+    const v = applyCompletion({
       reviewId: RID,
-      // Missing clean-code. Cached covers performance only.
-      providedLensIds: ["security"],
+      results: [ok("security")],
+      finalize: true,
     });
     expect(v.ok).toBe(false);
     if (v.ok) throw new Error();
     expect(v.code).toBe("missing_lenses");
     if (v.code !== "missing_lenses") throw new Error();
     expect(v.missing).toEqual(["clean-code"]);
-    // Session should remain started -- caching state must not drive
-    // a premature transition when the submission is incomplete.
     expect(getReview(RID)?.status).toBe("started");
   });
 
@@ -228,11 +383,10 @@ describe("validateAndComplete with T-015 cachedResults", () => {
         ],
       ]),
     });
-    // The agent submitted security too; the state machine does not
-    // care about the overlap, only about coverage.
-    const v = validateAndComplete({
+    const v = applyCompletion({
       reviewId: RID,
-      providedLensIds: ["security", "clean-code", "performance"],
+      results: LENSES.map((l) => ok(l)),
+      finalize: true,
     });
     expect(v.ok).toBe(true);
     if (!v.ok) throw new Error();

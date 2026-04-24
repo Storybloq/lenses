@@ -47,6 +47,14 @@ export type BlockingPolicy = z.infer<typeof BlockingPolicySchema>;
  * calling `BlockingPolicySchema.parse({})` to avoid a per-parse
  * self-reference into the schema.
  */
+/**
+ * T-022: caller-configurable retry cap. Matches codex-bridge's 2-attempt
+ * policy by default. `attempt <= maxAttempts` may emit a `nextActions[]`
+ * entry on parse failure; `attempt == maxAttempts` (or greater) terminates
+ * with the lens's errors surfaced in `parseErrors[]`.
+ */
+export const DEFAULT_MAX_ATTEMPTS = 2;
+
 export const MergerConfigSchema = z
   .object({
     confidenceFloor: z.number().min(0).max(1).default(0.6),
@@ -54,6 +62,7 @@ export const MergerConfigSchema = z
       alwaysBlock: [...DEFAULT_ALWAYS_BLOCK],
       neverBlock: [],
     })),
+    maxAttempts: z.number().int().min(1).default(DEFAULT_MAX_ATTEMPTS),
   })
   .strict()
   .default(() => ({}));
@@ -78,5 +87,6 @@ export const DEFAULT_MERGER_CONFIG: MergerConfig = (() => {
       alwaysBlock: Object.freeze([...parsed.blockingPolicy.alwaysBlock]),
       neverBlock: Object.freeze([...parsed.blockingPolicy.neverBlock]),
     }),
+    maxAttempts: parsed.maxAttempts,
   }) as MergerConfig;
 })();

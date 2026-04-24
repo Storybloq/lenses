@@ -74,14 +74,22 @@ export const CompleteParamsSchema = z
         .object({
           lensId: z.string().min(1),
           output: z.unknown(),
+          // T-022: per-lens attempt counter for the cooperative retry
+          // protocol. Absent (or 1) is the first submission. Incremented
+          // on resubmission after a `nextActions[]` entry. Intra-call
+          // uniqueness is on `lensId` ALONE -- multi-attempt submissions
+          // for the same lens live in separate calls, not the same
+          // `results[]` array.
+          attempt: z.number().int().min(1).default(1),
         })
         .strict(),
     ),
     // T-011: optional merger-time config (confidence floor + blocking
-    // policy). Undefined cascades to `DEFAULT_MERGER_CONFIG` at pipeline
-    // time. Left `.optional()` (no `.default(...)`) so the parsed
-    // `CompleteParams` surface reflects whether the caller sent the
-    // field -- the pipeline decides the default, not the schema.
+    // policy + T-022 maxAttempts). Undefined cascades to
+    // `DEFAULT_MERGER_CONFIG` at pipeline time. Left `.optional()` (no
+    // `.default(...)`) so the parsed `CompleteParams` surface reflects
+    // whether the caller sent the field -- the pipeline decides the
+    // default, not the schema.
     mergerConfig: MergerConfigSchema.optional(),
   })
   .strict()
@@ -99,3 +107,16 @@ export const CompleteParamsSchema = z
     });
   });
 export type CompleteParams = z.infer<typeof CompleteParamsSchema>;
+
+/**
+ * T-022: input to `lens_review_get_prompt`. Looks up the activation prompt
+ * for a specific lens within an active review. Stateless -- same input
+ * always yields the same output for the lifetime of the review.
+ */
+export const GetPromptParamsSchema = z
+  .object({
+    reviewId: z.string().min(1),
+    lensId: z.string().min(1),
+  })
+  .strict();
+export type GetPromptParams = z.infer<typeof GetPromptParamsSchema>;

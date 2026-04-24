@@ -143,7 +143,11 @@ describe("handleLensReviewComplete -- argument validation", () => {
     expect(text).toContain("lens_review_complete: invalid arguments");
   });
 
-  it("a malformed output entry is converted to a synthetic error, not a hard rejection", async () => {
+  // T-022: a malformed output entry no longer silently becomes a
+  // syntheticError — it surfaces via `parseErrors[]` AND, if attempts
+  // remain, triggers a `nextActions[]` retry which downgrades the
+  // verdict to `revise` so the caller knows there is unresolved state.
+  it("a malformed output surfaces in parseErrors[] + nextActions[] and downgrades to revise", async () => {
     const { reviewId, lensIds } = await startPlanReview({
       lensConfig: { lenses: ["security", "clean-code"] },
     });
@@ -155,12 +159,226 @@ describe("handleLensReviewComplete -- argument validation", () => {
     const { isError, body } = await callComplete({ reviewId, results });
     expect(isError).toBe(false);
     const verdict = ReviewVerdictSchema.parse(body);
-    // The one real lens contributes one minor finding. The malformed
-    // lens is coerced to status: "error" with no findings, so it adds
-    // nothing to the counts.
-    expect(verdict.verdict).toBe("approve");
+    // The clean lens still contributes its minor finding. Verdict is
+    // downgraded to `revise` because the malformed lens has a retry
+    // queued.
+    expect(verdict.verdict).toBe("revise");
     expect(verdict.minor).toBe(1);
     expect(verdict.findings).toHaveLength(1);
+    // parseErrors[] surfaces the specific issues on the malformed lens.
+    expect(verdict.parseErrors).toHaveLength(1);
+    expect(verdict.parseErrors[0]?.lensId).toBe(lensIds[0]);
+    // nextActions[] carries the retry instruction for that lens.
+    expect(verdict.nextActions).toHaveLength(1);
+    expect(verdict.nextActions[0]?.lensId).toBe(lensIds[0]);
+    expect(verdict.nextActions[0]?.attempt).toBe(2);
+  });
+});
+
+/**
+ * T-022 contract regression pins.
+ *
+ * Live-test regression (2026-04-23): an orchestrator injected `lensId`
+ * into the per-lens `output` envelope for its own tracking, which used
+ * to trip `.strict()` on `LensOutputSchema`, produce a `syntheticError`,
+ * and make all five real findings vanish via the `status !== "ok"`
+ * dedup filter. The fix is envelope `.passthrough()` + envelope-vs-
+ * finding parseError classification.
+ */
+describe("handleLensReviewComplete -- T-022 contract fixes", () => {
+  it("unknown ENVELOPE field does NOT swallow findings (live-test regression)", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // Replicate the orchestrator's bookkeeping injection: an extra
+    // `lensId` field inside `output`. Before T-022 this caused the
+    // whole lens's findings to vanish.
+    const results = lensIds.map((id) => ({
+      lensId: id,
+      output: {
+        ...ok([finding("minor", { id: `f-${id}`, confidence: 0.75 })]),
+        lensId: id, // the contract-leak-triggering injection
+      },
+    }));
+    const { isError, body } = await callComplete({ reviewId, results });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    // Both findings must surface. No parseErrors, no nextActions.
+    expect(verdict.findings).toHaveLength(2);
+    expect(verdict.minor).toBe(2);
+    expect(verdict.parseErrors).toHaveLength(0);
+    expect(verdict.nextActions).toHaveLength(0);
+    expect(verdict.hadAnyFindings).toBe(true);
+  });
+
+  it("malformed FINDING surfaces in parseErrors[] but does not drop the sibling lens", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    const results = lensIds.map((id, idx) =>
+      idx === 0
+        ? {
+            lensId: id,
+            // Malformed finding: missing required fields. Triggers
+            // per-finding strict-mode rejection → phase "finding".
+            output: {
+              status: "ok",
+              findings: [{ id: "f1", severity: "minor" }],
+              error: null,
+              notes: null,
+            },
+          }
+        : { lensId: id, output: ok([finding("minor", { confidence: 0.75 })]) },
+    );
+    const { isError, body } = await callComplete({ reviewId, results });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.findings).toHaveLength(1);
+    expect(verdict.parseErrors).toHaveLength(1);
+    expect(verdict.parseErrors[0]?.lensId).toBe(lensIds[0]);
+    expect(verdict.parseErrors[0]?.phase).toBe("finding");
+  });
+
+  it("below-floor finding surfaces in deferred[] with reason below_confidence_floor", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    const results = [
+      {
+        lensId: lensIds[0],
+        output: ok([
+          finding("minor", { id: "low", confidence: 0.1, file: "a.ts", line: 1 }),
+        ]),
+      },
+      {
+        lensId: lensIds[1],
+        output: ok([
+          finding("minor", { id: "ok", confidence: 0.8, file: "b.ts", line: 1 }),
+        ]),
+      },
+    ];
+    const { isError, body } = await callComplete({ reviewId, results });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.findings).toHaveLength(1);
+    expect(verdict.findings[0]?.id).toBe("ok");
+    expect(verdict.deferred).toHaveLength(1);
+    expect(verdict.deferred[0]?.finding.id).toBe("low");
+    expect(verdict.deferred[0]?.reason).toBe("below_confidence_floor");
+    expect(verdict.suppressedFindingCount).toBe(1);
+    expect(verdict.hadAnyFindings).toBe(true);
+  });
+
+  it("hadAnyFindings is distinguishable from a clean approve", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // No findings from either lens → hadAnyFindings=false.
+    const clean = lensIds.map((id) => ({ lensId: id, output: ok([]) }));
+    const { body } = await callComplete({ reviewId, results: clean });
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.findings).toEqual([]);
+    expect(verdict.deferred).toEqual([]);
+    expect(verdict.hadAnyFindings).toBe(false);
+    expect(verdict.verdict).toBe("approve");
+  });
+
+  it("retry flow: attempt=2 resolves the malformed lens and verdict returns to approve", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    const malformed = {
+      lensId: lensIds[0],
+      output: { status: "ok" /* missing findings/error/notes */ },
+      attempt: 1,
+    };
+    const clean = { lensId: lensIds[1], output: ok([]), attempt: 1 };
+    const first = await callComplete({
+      reviewId,
+      results: [malformed, clean],
+    });
+    expect(first.isError).toBe(false);
+    const firstVerdict = ReviewVerdictSchema.parse(first.body);
+    expect(firstVerdict.verdict).toBe("revise");
+    expect(firstVerdict.nextActions).toHaveLength(1);
+    expect(firstVerdict.nextActions[0]?.attempt).toBe(2);
+
+    // Resubmit attempt 2 with a clean payload for the same lens.
+    const retry = await callComplete({
+      reviewId,
+      results: [{ lensId: lensIds[0], output: ok([]), attempt: 2 }],
+    });
+    expect(retry.isError).toBe(false);
+    const retryVerdict = ReviewVerdictSchema.parse(retry.body);
+    expect(retryVerdict.verdict).toBe("approve");
+    expect(retryVerdict.nextActions).toEqual([]);
+    expect(retryVerdict.parseErrors).toEqual([]);
+    // L-003: after a clean retry with no findings, hadAnyFindings stays
+    // false — distinguishable from the "concerns suppressed" case.
+    expect(retryVerdict.hadAnyFindings).toBe(false);
+  });
+
+  it("retry exhaustion at max_attempts terminates with parseErrors[], no more nextActions", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // First call: malformed + clean. Default maxAttempts=2 → one retry.
+    const firstRes = await callComplete({
+      reviewId,
+      results: [
+        { lensId: lensIds[0], output: { status: "ok" }, attempt: 1 },
+        { lensId: lensIds[1], output: ok([]), attempt: 1 },
+      ],
+    });
+    expect(firstRes.isError).toBe(false);
+    const firstVerdict = ReviewVerdictSchema.parse(firstRes.body);
+    expect(firstVerdict.nextActions).toHaveLength(1);
+
+    // Retry is also malformed; attempt=2 reaches maxAttempts, so no
+    // further nextActions are emitted.
+    const retryRes = await callComplete({
+      reviewId,
+      results: [
+        { lensId: lensIds[0], output: { status: "ok" }, attempt: 2 },
+      ],
+    });
+    expect(retryRes.isError).toBe(false);
+    const retryVerdict = ReviewVerdictSchema.parse(retryRes.body);
+    expect(retryVerdict.nextActions).toHaveLength(0);
+    expect(retryVerdict.parseErrors).toHaveLength(1);
+    expect(retryVerdict.parseErrors[0]?.attempt).toBe(2);
+  });
+
+  it("stale attempt (resubmit with same or earlier number) is rejected", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // First call covers both lenses at attempt 1. Session advances.
+    await callComplete({
+      reviewId,
+      results: [
+        {
+          lensId: lensIds[0],
+          output: { status: "ok" },
+          attempt: 1,
+        },
+        { lensId: lensIds[1], output: ok([]), attempt: 1 },
+      ],
+    });
+    // Resubmit attempt 1 for the malformed lens (should be rejected
+    // as stale).
+    const stale = await callComplete({
+      reviewId,
+      results: [
+        {
+          lensId: lensIds[0],
+          output: { status: "ok" },
+          attempt: 1,
+        },
+      ],
+    });
+    expect(stale.isError).toBe(true);
+    expect(stale.text).toContain("stale attempt");
   });
 });
 

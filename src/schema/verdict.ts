@@ -1,6 +1,11 @@
 import { z } from "zod";
 
 import { MergedFindingSchema, type Severity } from "./finding.js";
+import {
+  DeferredFindingSchema,
+  NextActionSchema,
+  ParseErrorSchema,
+} from "./review-protocol.js";
 
 /** Top-level verdict returned by `lens_review_complete`. */
 export const VerdictSchema = z.enum(["approve", "revise", "reject"]);
@@ -47,6 +52,19 @@ const SEVERITY_COUNT_FIELDS: readonly Severity[] = [
  * the CLAUDE.md architecture contract. A `superRefine` enforces that the
  * top-level severity counts equal the number of findings with that severity,
  * so a bug in T-013 cannot emit internally inconsistent payloads.
+ *
+ * T-022 extensions:
+ *  - `parseErrors[]` — lens payloads that failed validation at hop-2. Replaces
+ *    the silent `syntheticError` swallow path.
+ *  - `deferred[]` — findings dropped from `findings[]` (e.g., below the
+ *    confidence floor) with the reason attached. `suppressedFindingCount`
+ *    mirrors `deferred.length` for callers that only want the number.
+ *  - `hadAnyFindings` — true iff any lens produced ≥1 finding at parse time,
+ *    independent of deferral/suppression. Disambiguates `findings: []`
+ *    between "no concerns" and "concerns suppressed" (L-003).
+ *  - `nextActions[]` — cooperative retry instructions. When non-empty, the
+ *    verdict MUST be `revise` (or `reject` if blocking > 0); the caller
+ *    re-spawns the named lenses and resubmits with incremented `attempt`.
  */
 export const ReviewVerdictSchema = z
   .object({
@@ -58,6 +76,11 @@ export const ReviewVerdictSchema = z
     minor: z.number().int().min(0),
     suggestion: z.number().int().min(0),
     sessionId: z.string().min(1),
+    parseErrors: z.array(ParseErrorSchema).default([]),
+    deferred: z.array(DeferredFindingSchema).default([]),
+    suppressedFindingCount: z.number().int().min(0).default(0),
+    hadAnyFindings: z.boolean(),
+    nextActions: z.array(NextActionSchema).default([]),
   })
   .strict()
   .superRefine((val, ctx) => {
@@ -81,6 +104,41 @@ export const ReviewVerdictSchema = z
         code: z.ZodIssueCode.custom,
         path: ["verdict"],
         message: `verdict must be 'reject' when blocking > 0 (got '${val.verdict}')`,
+      });
+    }
+    // T-022: suppressedFindingCount is a caller-friendly mirror of
+    // deferred.length; inconsistency here is a merger bug.
+    if (val.suppressedFindingCount !== val.deferred.length) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["suppressedFindingCount"],
+        message: `suppressedFindingCount (${val.suppressedFindingCount}) must equal deferred.length (${val.deferred.length})`,
+      });
+    }
+    // T-022 (L-003 disambiguation): `hadAnyFindings === false` means no
+    // lens produced a finding at parse time. In that case no finding
+    // content exists anywhere -- not in `findings[]`, not in `deferred[]`,
+    // not in `parseErrors[]` (parseErrors are not findings).
+    if (
+      val.hadAnyFindings === false &&
+      val.findings.length + val.deferred.length > 0
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["hadAnyFindings"],
+        message: `hadAnyFindings=false but findings+deferred=${val.findings.length + val.deferred.length}`,
+      });
+    }
+    // T-022: when the server is asking for retries, the caller must
+    // never see verdict='approve'. 'reject' is still permitted when
+    // blocking > 0 (blocking findings can coexist with retryable
+    // errors on other lenses). 'revise' is the canonical "retry
+    // available" verdict.
+    if (val.nextActions.length > 0 && val.verdict === "approve") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["verdict"],
+        message: `verdict cannot be 'approve' while nextActions.length > 0 (retries pending)`,
       });
     }
   });

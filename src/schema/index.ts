@@ -34,8 +34,29 @@ export {
 export {
   BlockingPolicySchema,
   DEFAULT_ALWAYS_BLOCK,
+  DEFAULT_MAX_ATTEMPTS,
   DEFAULT_MERGER_CONFIG,
   MergerConfigSchema,
   type BlockingPolicy,
   type MergerConfig,
 } from "./merger-config.js";
+
+export {
+  DeferralReasonSchema,
+  DeferredFindingSchema,
+  NextActionSchema,
+  ParseErrorPhaseSchema,
+  ParseErrorSchema,
+  ZodIssueWireSchema,
+  type DeferralReason,
+  type DeferredFinding,
+  type NextAction,
+  type ParseError,
+  type ParseErrorPhase,
+  type ZodIssueWire,
+} from "./review-protocol.js";
+
+export {
+  GetPromptParamsSchema,
+  type GetPromptParams,
+} from "./params.js";

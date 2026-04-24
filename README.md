@@ -14,10 +14,11 @@ npm install -g @storybloq/lenses
 claude mcp add lenses -s user -- lenses --mcp
 ```
 
-After registration, two tools become available in your Claude Code session:
+After registration, three tools become available in your Claude Code session:
 
-- `lens_review_start` — Returns per-lens prompts for your agent to spawn as subagents, plus any cached findings from prior rounds.
-- `lens_review_complete` — Takes the subagent outputs and returns the merged verdict, findings, tensions, and blocking list.
+- `lens_review_start` — Returns `{reviewId, agents: [{id, model, promptHash, expiresAt}], cached}`. Refs-not-prompts shape keeps the hop-1 payload small; fetch the actual prompt for each agent via `lens_review_get_prompt` before spawning.
+- `lens_review_get_prompt` — Looks up the full prompt for one lens in an active review. Stateless per `(reviewId, lensId)`.
+- `lens_review_complete` — Accepts the subagent outputs (with optional `attempt` for retry) and returns the merged verdict. The envelope includes `parseErrors[]`, `deferred[]`, `suppressedFindingCount`, `hadAnyFindings`, and `nextActions[]` for the cooperative retry protocol.
 
 ## Architecture
 
@@ -25,4 +26,4 @@ See `CLAUDE.md` in the source repository for the two-hop flow, lens activation l
 
 ## License
 
-MIT
+PolyForm-Noncommercial-1.0.0

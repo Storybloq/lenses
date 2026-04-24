@@ -19,14 +19,20 @@ import { runMergerPipeline, type LensRunResult } from "../merger/pipeline.js";
 import { LensOutputSchema } from "../schema/finding.js";
 import {
   CompleteParamsSchema,
+  DEFAULT_MAX_ATTEMPTS,
   ReviewVerdictSchema,
   type CompleteParams,
   type LensOutput,
+  type NextAction,
+  type ParseError,
+  type ParseErrorPhase,
   type ReviewVerdict,
+  type ZodIssueWire,
 } from "../schema/index.js";
 import {
-  validateAndComplete,
+  applyCompletion,
   type ReviewSession,
+  type SubmittedResult,
 } from "../state/review-state.js";
 
 export const LENS_REVIEW_COMPLETE_NAME = "lens_review_complete";
@@ -41,7 +47,8 @@ export const lensReviewCompleteDefinition = {
   name: LENS_REVIEW_COMPLETE_NAME,
   description:
     "Finish a multi-lens review. Accepts the raw outputs from each spawned agent; " +
-    "returns the merged, confidence-filtered verdict. Hop 2 of 2.",
+    "returns the merged, confidence-filtered verdict. Hop 2 of 2 " +
+    "(or hop 2+ of N if the prior call emitted nextActions[] for retry).",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -55,14 +62,16 @@ export const lensReviewCompleteDefinition = {
             // `output` is `unknown` on the wire; each entry is parsed
             // per-lens so one malformed payload does not reject the call.
             output: {},
+            // T-022: optional retry attempt counter; 1 on first call,
+            // incremented on resubmission after a nextActions[] entry.
+            attempt: { type: "integer", minimum: 1 },
           },
           required: ["lensId", "output"],
           additionalProperties: false,
         },
       },
       // T-011: optional merger-time config (confidence floor + blocking
-      // policy). Full validation happens at the Zod boundary, so the
-      // listTools hint is kept deliberately loose.
+      // policy + T-022 maxAttempts).
       mergerConfig: { type: "object" },
     },
     required: ["reviewId", "results"],
@@ -77,44 +86,44 @@ function errorResult(message: string): CallToolResult {
   };
 }
 
-/**
- * Build a LensOutput with `status: "error"`. Guards the message so an
- * empty summary from `summarizeZod` cannot produce a payload that
- * itself fails `LensOutputSchema.superRefine` -- which would later
- * cause `ReviewVerdictSchema.parse` to throw and turn graceful
- * degradation into a hard 500.
- */
-function syntheticError(message: string): LensOutput {
-  return {
-    status: "error",
-    error: message.length > 0 ? message : "lens output parse error",
-    findings: [],
-    notes: null,
-  };
-}
-
 function summarizeZod(err: z.ZodError): string {
   return err.issues
     .map((i) => `${i.path.join(".")}: ${i.message}`)
     .join("; ");
 }
 
+function zodIssuesToWire(err: z.ZodError): ZodIssueWire[] {
+  return err.issues.map((i) => ({
+    path: i.path.join("."),
+    message: i.message,
+  }));
+}
+
 /**
- * Append this round to the disk session cache, then sweep stale
- * sessions. Every step is best-effort per RULES.md §4: any error is
- * logged to stderr but never propagated, so the agent still receives
- * its verdict even if the disk is full or permissions are wrong. The
- * documented cost is that the agent may later present a sessionId
- * that does not resolve to a file; T-015's read-at-start path treats
- * that identically to "round 1."
- *
- * The entire body sits inside one outer try/catch (in addition to the
- * per-call guards) so that a throw from `round` construction itself
- * -- however unlikely -- cannot escape into the caller's tool-error
- * path. The caller in `handleLensReviewComplete` relies on this
- * guarantee by invoking `persistRoundBestEffort` outside its own
- * outer try/catch: any cache trouble must be logged and swallowed
- * here, never become `isError: true`.
+ * T-022 phase classifier: given a failed `LensOutputSchema.safeParse`,
+ * decide whether the caller should see the failure as an envelope
+ * problem (typed field has wrong type) or a per-finding problem (a
+ * finding failed `.strict()` / file-line correlation). Implementation
+ * matches the plan's explicit algorithm:
+ *   - any issue with path[0] === "findings" → "finding"
+ *   - otherwise "envelope"
+ * Ties (mixed issues) resolve to "finding" because that's the more
+ * actionable classification -- the caller can re-prompt the LLM to fix
+ * its finding shape, whereas envelope-shape problems are harder to
+ * self-correct.
+ */
+function classifyPhase(err: z.ZodError): ParseErrorPhase {
+  for (const issue of err.issues) {
+    if (issue.path.length > 0 && issue.path[0] === "findings") return "finding";
+  }
+  return "envelope";
+}
+
+/**
+ * Persist round summary to the disk session cache. Best-effort per
+ * RULES.md §4: any error is logged but never propagated. Runs OUTSIDE
+ * the outer try/catch in `handleLensReviewComplete` so a disk error
+ * cannot flip `isError: true`.
  */
 function persistRoundBestEffort(
   session: ReviewSession,
@@ -159,40 +168,8 @@ function persistRoundBestEffort(
 }
 
 /**
- * T-015 per-lens cache writeback. Walks every fresh agent-submitted
- * `ok` result and persists `(lensId, promptHash, findings, notes)`
- * to disk so the next identical prompt hits the cache.
- *
- * `agentSubmittedLensIds` is the set of lenses the AGENT sent in this
- * call and whose payload passed `LensOutputSchema.safeParse`. This
- * gate is the single source of truth for "should we write?" and is
- * driven off the parsed payload, NOT the session's cache state. Plan
- * §9 ("fresh wins on overlap") requires that when an agent resubmits
- * a lens the server had already cache-hit on, the fresh submission
- * overwrites the on-disk entry -- so guarding on
- * `session.cachedResults.has` would silently drop a legitimate
- * overwrite. The cache file key is `(lensId, promptHash)`, and the
- * fresh and cached entries share the same promptHash for the same
- * round, so the overwrite is in-place and idempotent when payloads
- * match.
- *
- * Skipped entries:
- *   - `status: "error"` outputs: we want a retry next round, not a
- *     pinned failure. (filtered via `entry.output.status !== "ok"`)
- *   - Cached re-injections from `session.cachedResults`: they are NOT
- *     in `agentSubmittedLensIds`, so they naturally fall through.
- *     Re-writing an identical record would be wasted I/O.
- *   - Synthetic-error entries from unknown lens id / malformed
- *     payload: excluded from `agentSubmittedLensIds` at construction.
- *   - Lenses without a stored promptHash: defensive -- could only
- *     happen via a register/run mismatch, and a missing hash means
- *     we cannot key the entry.
- *
- * Peer to `persistRoundBestEffort` -- NOT nested inside it. Both are
- * invoked sequentially at the same call site outside the outer
- * try/catch of `handleLensReviewComplete`, each with its own
- * top-level try/catch so a lens-cache failure cannot be confused
- * with (or swallowed by) a session-cache failure on stderr.
+ * T-015 per-lens cache writeback. Same RULES.md §4 discipline as
+ * `persistRoundBestEffort` — runs outside the outer try/catch.
  */
 function persistLensCacheBestEffort(
   session: ReviewSession,
@@ -233,15 +210,50 @@ function persistLensCacheBestEffort(
   }
 }
 
+/**
+ * T-022: decide whether a lens's current state warrants a retry. A retry
+ * entry is emitted when the lens returned `status: "error"` OR the lens's
+ * payload failed finding-level validation, AND the lens has budget
+ * remaining (`latestAttempt < maxAttempts`).
+ */
+interface RetryCandidate {
+  readonly lensId: LensId;
+  readonly latestAttempt: number;
+  readonly reason: string;
+}
+
+function buildNextActions(
+  session: ReviewSession,
+  candidates: readonly RetryCandidate[],
+  maxAttempts: number,
+): NextAction[] {
+  const out: NextAction[] = [];
+  for (const c of candidates) {
+    if (c.latestAttempt >= maxAttempts) continue;
+    const prompt = session.prompts.get(c.lensId);
+    if (prompt === undefined) continue; // cached lens has no prompt; never retries
+    // Any spawned lens has a matching expiresAt registered at hop-1
+    // (see `start.ts`), so an undefined lookup here is a server-side
+    // invariant break, not an expected path. Skip rather than silently
+    // manufacture a synthetic deadline that has no relationship to the
+    // caller's `lensTimeout` config.
+    const expiresMs = session.perLensExpiresAt.get(c.lensId);
+    if (expiresMs === undefined) continue;
+    const expiresAt = new Date(expiresMs).toISOString();
+    const retryPrompt = `${prompt}\n\n<retry-context>Prior attempt ${c.latestAttempt} failed validation: ${c.reason}. Return only valid JSON matching the lens output schema.</retry-context>\n`;
+    out.push({
+      lensId: c.lensId,
+      retryPrompt,
+      attempt: c.latestAttempt + 1,
+      expiresAt,
+    });
+  }
+  return out;
+}
+
 export async function handleLensReviewComplete(
   req: CallToolRequest,
 ): Promise<CallToolResult> {
-  // Top-level envelope parse gets its OWN catch so that a ZodError
-  // from `CompleteParamsSchema` produces the "invalid arguments:"
-  // prefix -- and the defense-in-depth `ReviewVerdictSchema.parse`
-  // below (post state transition) does NOT accidentally reuse that
-  // label. Plan section 5 distinguishes the two error surfaces
-  // explicitly.
   let parsed: CompleteParams;
   try {
     parsed = CompleteParamsSchema.parse(req.params.arguments);
@@ -257,83 +269,115 @@ export async function handleLensReviewComplete(
     return errorResult(`lens_review_complete: unknown error`);
   }
 
-  // `session` and `safe` are declared OUTSIDE the outer try/catch so
-  // the cache write (persistRoundBestEffort) can run strictly after
-  // the try/catch completes successfully. Structurally this is what
-  // makes RULES.md §4 ("if cache is unavailable, skip caching, don't
-  // fail") watertight: even if some future edit accidentally threw
-  // from the cache call or removed persistRoundBestEffort's own
-  // outer guard, the throw could not reach the outer catch and
-  // couldn't turn a successful verdict into `isError: true`.
   let session: ReviewSession;
   let safe: ReviewVerdict;
-  // T-015: `perLens` is hoisted so `persistLensCacheBestEffort` can
-  // run after the try/catch closes, exactly mirroring the shape of
-  // `safe`/`persistRoundBestEffort` above. Cache writeback must not
-  // be nested inside the try block: a throw from writeback would
-  // otherwise hit the outer catch and turn a successful verdict into
-  // `isError: true`, violating RULES.md §4.
   let perLens: LensRunResult[];
-  // T-015 review round 2: tracks the lensIds the agent actually
-  // submitted this round with a payload that PARSED cleanly as an
-  // `ok`/`error` LensOutput. Cache writeback gates on this set so a
-  // fresh resubmission of a previously-cached lens overwrites the
-  // disk entry (plan §9 "fresh wins"), while synthetic-error entries
-  // from unknown lens id / malformed payload are excluded.
   const agentSubmittedLensIds = new Set<LensId>();
   try {
-    // State machine check BEFORE per-lens Zod work. No point paying
-    // the Zod cost for a reviewId that was never issued or has
-    // already been completed. `validateAndComplete` atomically
-    // transitions the session to `complete` on success -- if anything
-    // below throws, the session is already marked complete and the
-    // outer catch returns an isError response (see plan section 11
-    // "No completion rollback").
-    const stateResult = validateAndComplete({
-      reviewId: parsed.reviewId,
-      // The state machine reads these as string Set keys; unknown-id
-      // enforcement happens per-lens below. The state machine accepts
-      // supersets by design, so an invented id here is not an error
-      // at this layer -- it becomes a synthetic-error entry
-      // downstream.
-      providedLensIds: parsed.results.map((r) => r.lensId as LensId),
-    });
-    if (!stateResult.ok) {
-      return errorResult(`lens_review_complete: ${stateResult.message}`);
-    }
+    // First pass: classify each submitted result -- does it parse as a
+    // clean LensOutput, or does it produce a parseError we should
+    // surface? We do NOT advance the state machine until we know the
+    // shape of each submission; applyCompletion needs the LensOutput
+    // object (including syntheticError placeholders for hard-failed
+    // lenses) to store the latest view.
+    const submissions: SubmittedResult[] = [];
+    const parseErrors: ParseError[] = [];
+    const retryCandidates: RetryCandidate[] = [];
+    const maxAttempts =
+      parsed.mergerConfig?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
 
-    perLens = [];
     for (const r of parsed.results) {
+      const attempt = r.attempt ?? 1;
+
       if (!(r.lensId in LENSES)) {
-        perLens.push({
-          lensId: r.lensId as LensId,
-          output: syntheticError(`unknown lens id: ${r.lensId}`),
+        // Unknown lens id: treat as internal parse failure. No retry
+        // possible for an invented lens; surface as a terminal
+        // parseError and do NOT update the state machine for it.
+        parseErrors.push({
+          lensId: r.lensId,
+          attempt,
+          phase: "internal",
+          zodIssues: [
+            { path: "lensId", message: `unknown lens id: ${r.lensId}` },
+          ],
         });
         continue;
       }
+
       const res = LensOutputSchema.safeParse(r.output);
-      perLens.push({
-        lensId: r.lensId as LensId,
-        output: res.success ? res.data : syntheticError(summarizeZod(res.error)),
-      });
-      // Only mark lensId as agent-submitted when the payload PARSED;
-      // synthetic-error entries (malformed payload) must not trigger
-      // cache writes. `status: "error"` parses fine, but the writeback
-      // function filters those out separately.
       if (res.success) {
+        submissions.push({
+          lensId: r.lensId as LensId,
+          output: res.data as LensOutput,
+          attempt,
+        });
         agentSubmittedLensIds.add(r.lensId as LensId);
+        // Lens may still be in a retryable `status: "error"` state.
+        if (res.data.status === "error") {
+          retryCandidates.push({
+            lensId: r.lensId as LensId,
+            latestAttempt: attempt,
+            reason: res.data.error ?? "lens reported error",
+          });
+        }
+      } else {
+        const phase = classifyPhase(res.error);
+        parseErrors.push({
+          lensId: r.lensId,
+          attempt,
+          phase,
+          zodIssues: zodIssuesToWire(res.error),
+        });
+        // For retryable parse failures (finding-shape or envelope-shape),
+        // still advance the state machine so subsequent resubmissions
+        // carry the correct `attempt` counter. The stored output is a
+        // placeholder syntheticError — it does NOT contribute findings
+        // to dedup/merger (status !== "ok"), but it pins the attempt.
+        const placeholder: LensOutput = {
+          status: "error",
+          findings: [],
+          error: `parse failure (${phase}): ${summarizeZod(res.error)}`,
+          notes: null,
+        };
+        submissions.push({
+          lensId: r.lensId as LensId,
+          output: placeholder,
+          attempt,
+        });
+        retryCandidates.push({
+          lensId: r.lensId as LensId,
+          latestAttempt: attempt,
+          reason: summarizeZod(res.error),
+        });
       }
     }
 
-    // T-015: re-inject cached lens results so the merger treats them
-    // identically to fresh findings. Cached entries were resolved at
-    // hop-1 time and carried on the ReviewSession; agent-submitted
-    // results for the same lensId (e.g., because the agent ignored
-    // the cache hint and re-ran the lens) already appear earlier in
-    // perLens, where dedup handles the overlap. Fresh-first ordering
-    // matches plan §9 "fresh wins" -- the merger's file+line dedup
-    // keeps the first occurrence per key.
-    for (const [lensId, cached] of stateResult.session.cachedResults) {
+    // Decide finalize: true ONLY when no retry candidates have budget
+    // remaining. If any lens can still retry, we keep the session open.
+    const willEmitRetries = retryCandidates.some(
+      (c) => c.latestAttempt < maxAttempts,
+    );
+
+    const applied = applyCompletion({
+      reviewId: parsed.reviewId,
+      results: submissions,
+      finalize: !willEmitRetries,
+    });
+    if (!applied.ok) {
+      return errorResult(`lens_review_complete: ${applied.message}`);
+    }
+
+    session = applied.session;
+
+    // Build the full per-lens view the merger sees:
+    //   - latest successfully-parsed outputs (from session.perLensLatestOutput).
+    //   - cached outputs (from session.cachedResults, re-inflated as ok).
+    perLens = [];
+    for (const [lensId, out] of session.perLensLatestOutput) {
+      perLens.push({ lensId, output: out });
+    }
+    for (const [lensId, cached] of session.cachedResults) {
+      if (session.perLensLatestOutput.has(lensId)) continue; // fresh wins
       perLens.push({
         lensId,
         output: {
@@ -345,41 +389,29 @@ export async function handleLensReviewComplete(
       });
     }
 
-    // T-014: the cross-round sessionId lives on the stored
-    // ReviewSession (seeded at start-time). The pipeline now takes it
-    // as a distinct field -- reviewId is per-round, sessionId is
-    // cross-round. Only attach `mergerConfig` when the caller actually
-    // sent one -- `exactOptionalPropertyTypes` treats
-    // `{ mergerConfig: undefined }` differently from an absent key.
-    session = stateResult.session;
+    const nextActions = buildNextActions(session, retryCandidates, maxAttempts);
+
     const verdict = runMergerPipeline(
       parsed.mergerConfig === undefined
         ? {
             reviewId: parsed.reviewId,
             sessionId: session.sessionId,
             perLens,
+            parseErrors,
+            nextActions,
           }
         : {
             reviewId: parsed.reviewId,
             sessionId: session.sessionId,
             perLens,
             mergerConfig: parsed.mergerConfig,
+            parseErrors,
+            nextActions,
           },
     );
 
-    // Defense-in-depth: re-parse the computed verdict so a merger bug
-    // (e.g., severity counts that don't match findings) cannot leak
-    // through the tool boundary. A ZodError here is a SERVER-side
-    // issue, not bad user input, so the catch below does NOT use the
-    // "invalid arguments:" prefix.
     safe = ReviewVerdictSchema.parse(verdict);
   } catch (err) {
-    // ZodError extends Error; check it FIRST so a merger-regression
-    // verdict parse failure surfaces the flattened issue summary
-    // instead of ZodError.message's raw JSON blob. Uses "internal
-    // error:" (not "invalid arguments:") because a throw from this
-    // block means the merger emitted an inconsistent verdict -- a
-    // server bug, not bad user input.
     if (err instanceof z.ZodError) {
       return errorResult(
         `lens_review_complete: internal error: ${summarizeZod(err)}`,
@@ -391,12 +423,6 @@ export async function handleLensReviewComplete(
     return errorResult(`lens_review_complete: unknown error`);
   }
 
-  // T-014 session cache: persist this round's record and sweep stale
-  // sessions. This runs AFTER the try/catch closes -- combined with
-  // persistRoundBestEffort's own internal guards, cache trouble can
-  // never become `isError: true`. The `safe`-reparsed verdict is the
-  // ONLY source used for the record: it is the same payload the agent
-  // will see, so on-disk state cannot drift from the wire.
   persistRoundBestEffort(session, safe);
   persistLensCacheBestEffort(session, perLens, agentSubmittedLensIds);
 

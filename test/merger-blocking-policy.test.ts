@@ -43,55 +43,66 @@ function withPolicy(
 }
 
 describe("applyBlockingPolicy", () => {
-  it("empty findings array returns empty regardless of config", () => {
-    expect(applyBlockingPolicy([], DEFAULT_MERGER_CONFIG)).toEqual([]);
-    expect(
-      applyBlockingPolicy(
-        [],
-        withPolicy({
-          confidenceFloor: 0.9,
-          alwaysBlock: ["x"],
-          neverBlock: ["y"],
-        }),
-      ),
-    ).toEqual([]);
+  it("empty findings array returns empty kept and empty deferred", () => {
+    const out = applyBlockingPolicy([], DEFAULT_MERGER_CONFIG);
+    expect(out.kept).toEqual([]);
+    expect(out.deferred).toEqual([]);
+    const out2 = applyBlockingPolicy(
+      [],
+      withPolicy({
+        confidenceFloor: 0.9,
+        alwaysBlock: ["x"],
+        neverBlock: ["y"],
+      }),
+    );
+    expect(out2.kept).toEqual([]);
+    expect(out2.deferred).toEqual([]);
   });
 
-  it("default config keeps findings >= 0.6 confidence and drops < 0.6 (non-alwaysBlock)", () => {
-    const kept = mf("minor", { id: "k", category: "style", confidence: 0.6 });
+  it("default config keeps findings >= 0.6 confidence and defers < 0.6 (T-022)", () => {
+    const keep = mf("minor", { id: "k", category: "style", confidence: 0.6 });
     const dropped = mf("minor", {
       id: "d",
       category: "style",
       confidence: 0.59,
     });
-    const out = applyBlockingPolicy([kept, dropped], DEFAULT_MERGER_CONFIG);
-    expect(out).toHaveLength(1);
-    expect(out[0]!.id).toBe("k");
+    const { kept, deferred } = applyBlockingPolicy(
+      [keep, dropped],
+      DEFAULT_MERGER_CONFIG,
+    );
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.id).toBe("k");
+    // T-022: the dropped finding now surfaces via deferred[] instead of
+    // vanishing silently.
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]!.finding.id).toBe("d");
+    expect(deferred[0]!.reason).toBe("below_confidence_floor");
   });
 
   it("confidence floor is strict-less-than (exactly 0.6 passes at default)", () => {
     const f = mf("minor", { confidence: 0.6, category: "style" });
-    expect(applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG)).toEqual([f]);
+    const { kept, deferred } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept).toEqual([f]);
+    expect(deferred).toEqual([]);
   });
 
   it("alwaysBlock category bypasses the confidence floor and is promoted to blocking", () => {
-    // 0.1 confidence 'auth-bypass' would be dropped by the floor in any
-    // other category; alwaysBlock saves it AND promotes to blocking.
     const f = mf("suggestion", {
       category: "auth-bypass",
       confidence: 0.1,
       contributingLenses: ["security"],
     });
-    const out = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
-    expect(out).toHaveLength(1);
-    expect(out[0]!.severity).toBe("blocking");
-    expect(out[0]!.confidence).toBe(0.1);
+    const { kept, deferred } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.severity).toBe("blocking");
+    expect(kept[0]!.confidence).toBe(0.1);
+    expect(deferred).toEqual([]);
   });
 
   it("alwaysBlock promotes a minor category-matched finding to blocking", () => {
     const f = mf("minor", { category: "injection", confidence: 0.9 });
-    const out = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
-    expect(out[0]!.severity).toBe("blocking");
+    const { kept } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept[0]!.severity).toBe("blocking");
   });
 
   it("neverBlock demotes blocking -> major when ALL contributingLenses are in neverBlock", () => {
@@ -100,11 +111,11 @@ describe("applyBlockingPolicy", () => {
       confidence: 0.9,
       contributingLenses: ["clean-code", "performance"],
     });
-    const out = applyBlockingPolicy(
+    const { kept } = applyBlockingPolicy(
       [f],
       withPolicy({ neverBlock: ["clean-code", "performance"] }),
     );
-    expect(out[0]!.severity).toBe("major");
+    expect(kept[0]!.severity).toBe("major");
   });
 
   it("neverBlock does NOT demote when at least one contributingLens is outside neverBlock", () => {
@@ -113,29 +124,27 @@ describe("applyBlockingPolicy", () => {
       confidence: 0.9,
       contributingLenses: ["clean-code", "security"],
     });
-    const out = applyBlockingPolicy(
+    const { kept } = applyBlockingPolicy(
       [f],
       withPolicy({ neverBlock: ["clean-code"] }),
     );
-    expect(out[0]!.severity).toBe("blocking");
+    expect(kept[0]!.severity).toBe("blocking");
   });
 
   it("alwaysBlock beats neverBlock when category matches", () => {
-    // An injection finding raised only by a neverBlock lens should
-    // still end up blocking -- the category is the dominant rule.
     const f = mf("minor", {
       category: "injection",
       confidence: 0.9,
       contributingLenses: ["clean-code"],
     });
-    const out = applyBlockingPolicy(
+    const { kept } = applyBlockingPolicy(
       [f],
       withPolicy({
         alwaysBlock: ["injection"],
         neverBlock: ["clean-code"],
       }),
     );
-    expect(out[0]!.severity).toBe("blocking");
+    expect(kept[0]!.severity).toBe("blocking");
   });
 
   it("neverBlock leaves non-blocking severities alone (major from neverBlock stays major)", () => {
@@ -144,61 +153,68 @@ describe("applyBlockingPolicy", () => {
       confidence: 0.9,
       contributingLenses: ["clean-code"],
     });
-    const out = applyBlockingPolicy(
+    const { kept } = applyBlockingPolicy(
       [f],
       withPolicy({ neverBlock: ["clean-code"] }),
     );
-    expect(out[0]!.severity).toBe("major");
+    expect(kept[0]!.severity).toBe("major");
   });
 
   it("preserves reference identity when severity is unchanged", () => {
     const f = mf("minor", { category: "style", confidence: 0.9 });
-    const out = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
-    expect(out[0]).toBe(f);
+    const { kept } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept[0]).toBe(f);
   });
 
   it("already-blocking alwaysBlock finding below the floor is kept AND returns the same reference (no-op severity path)", () => {
-    // Exercises the interaction between (1) alwaysBlock bypassing the
-    // confidence floor and (2) the reference-identity optimization when
-    // severity is already blocking and alwaysBlock promotion is a no-op.
-    // A refactor that accidentally emits `{ ...f, severity }` in the
-    // no-op case would break this assertion.
     const f = mf("blocking", {
       category: "injection",
       confidence: 0.1,
       contributingLenses: ["security"],
     });
-    const out = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toBe(f);
-    expect(out[0]!.severity).toBe("blocking");
+    const { kept, deferred } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toBe(f);
+    expect(kept[0]!.severity).toBe("blocking");
+    expect(deferred).toEqual([]);
   });
 
   it("produces a fresh object when severity changes (does not mutate input)", () => {
     const f = mf("minor", { category: "injection", confidence: 0.9 });
     const inputSeverity = f.severity;
-    const out = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
-    expect(out[0]).not.toBe(f);
-    expect(out[0]!.severity).toBe("blocking");
-    expect(f.severity).toBe(inputSeverity); // input untouched
+    const { kept } = applyBlockingPolicy([f], DEFAULT_MERGER_CONFIG);
+    expect(kept[0]).not.toBe(f);
+    expect(kept[0]!.severity).toBe("blocking");
+    expect(f.severity).toBe(inputSeverity);
   });
 
   it("empty alwaysBlock: confidence floor applies to everything, no promotion", () => {
     const keep = mf("minor", { category: "injection", confidence: 0.9 });
     const drop = mf("minor", { category: "injection", confidence: 0.1 });
-    const out = applyBlockingPolicy(
+    const { kept, deferred } = applyBlockingPolicy(
       [keep, drop],
       withPolicy({ alwaysBlock: [] }),
     );
-    expect(out).toHaveLength(1);
-    expect(out[0]!.id).toBe(keep.id);
-    expect(out[0]!.severity).toBe("minor"); // no promotion
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.id).toBe(keep.id);
+    expect(kept[0]!.severity).toBe("minor");
+    // T-022: dropped finding surfaces via deferred[] instead of silent continue.
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]!.finding.id).toBe(drop.id);
+    expect(deferred[0]!.reason).toBe("below_confidence_floor");
   });
 
-  it("custom confidenceFloor=0.9 drops findings at 0.85", () => {
+  it("custom confidenceFloor=0.9 defers findings at 0.85", () => {
     const f = mf("major", { category: "style", confidence: 0.85 });
-    const out = applyBlockingPolicy([f], withPolicy({ confidenceFloor: 0.9 }));
-    expect(out).toHaveLength(0);
+    const { kept, deferred } = applyBlockingPolicy(
+      [f],
+      withPolicy({ confidenceFloor: 0.9 }),
+    );
+    expect(kept).toHaveLength(0);
+    // T-022: deferred carries the rejected finding with reason.
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]!.finding).toBe(f);
+    expect(deferred[0]!.reason).toBe("below_confidence_floor");
   });
 
   it("contributingLenses content is preserved unchanged by the policy", () => {
@@ -207,12 +223,11 @@ describe("applyBlockingPolicy", () => {
       confidence: 0.9,
       contributingLenses: ["security", "performance"],
     });
-    const out = applyBlockingPolicy(
+    const { kept } = applyBlockingPolicy(
       [f],
       withPolicy({ neverBlock: ["security", "performance"] }),
     );
-    // Demoted, but contributingLenses is verbatim and not a new array ref.
-    expect(out[0]!.contributingLenses).toBe(f.contributingLenses);
+    expect(kept[0]!.contributingLenses).toBe(f.contributingLenses);
   });
 
   it("does not mutate the input array or finding objects", () => {
@@ -220,13 +235,14 @@ describe("applyBlockingPolicy", () => {
     const b = mf("major", { id: "b", category: "style", confidence: 0.3 });
     const input: readonly MergedFinding[] = [a, b];
     const snapshot = { aSev: a.severity, bSev: b.severity };
-    const out = applyBlockingPolicy(input, DEFAULT_MERGER_CONFIG);
-    expect(input).toHaveLength(2); // not mutated
+    const { kept, deferred } = applyBlockingPolicy(input, DEFAULT_MERGER_CONFIG);
+    expect(input).toHaveLength(2);
     expect(a.severity).toBe(snapshot.aSev);
     expect(b.severity).toBe(snapshot.bSev);
-    // a is promoted to blocking; b is dropped by floor.
-    expect(out).toHaveLength(1);
-    expect(out[0]!.id).toBe("a");
-    expect(out[0]!.severity).toBe("blocking");
+    expect(kept).toHaveLength(1);
+    expect(kept[0]!.id).toBe("a");
+    expect(kept[0]!.severity).toBe("blocking");
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]!.finding.id).toBe("b");
   });
 });
