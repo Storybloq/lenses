@@ -23,7 +23,10 @@ import {
   type LensOutput,
   type Severity,
 } from "../src/schema/index.js";
-import { _resetForTests } from "../src/state/review-state.js";
+import {
+  _clearMapOnlyForTests,
+  _resetForTests,
+} from "../src/state/review-state.js";
 import { handleLensReviewComplete } from "../src/tools/complete.js";
 import { handleLensReviewStart } from "../src/tools/start.js";
 
@@ -37,17 +40,22 @@ import { handleLensReviewStart } from "../src/tools/start.js";
 // into state-machine assertions.
 let sessionDir: string;
 let lensCacheDir: string;
+let inFlightDir: string;
 beforeAll(() => {
   sessionDir = mkdtempSync(join(tmpdir(), "lenses-tools-complete-"));
   lensCacheDir = mkdtempSync(join(tmpdir(), "lenses-tools-complete-lc-"));
+  inFlightDir = mkdtempSync(join(tmpdir(), "lenses-tools-complete-if-"));
   process.env.LENSES_SESSION_DIR = sessionDir;
   process.env.LENSES_LENS_CACHE_DIR = lensCacheDir;
+  process.env.LENSES_IN_FLIGHT_DIR = inFlightDir;
 });
 afterAll(() => {
   delete process.env.LENSES_SESSION_DIR;
   delete process.env.LENSES_LENS_CACHE_DIR;
+  delete process.env.LENSES_IN_FLIGHT_DIR;
   rmSync(sessionDir, { recursive: true, force: true });
   rmSync(lensCacheDir, { recursive: true, force: true });
+  rmSync(inFlightDir, { recursive: true, force: true });
 });
 
 // Clear BOTH the in-memory state and the on-disk lens cache between
@@ -379,6 +387,66 @@ describe("handleLensReviewComplete -- T-022 contract fixes", () => {
     });
     expect(stale.isError).toBe(true);
     expect(stale.text).toContain("stale attempt");
+  });
+});
+
+/**
+ * T-024: in-flight state survives an MCP server restart. We simulate
+ * the restart by clearing ONLY the in-process Map (leaving the disk
+ * state intact), then calling hop-2 with the reviewId issued before
+ * the wipe. The handler must rehydrate the session from disk and emit
+ * a verdict.
+ */
+describe("handleLensReviewComplete -- T-024 restart recovery", () => {
+  it("reviewId survives a Map wipe; hop-2 still produces a verdict", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // Simulate restart: memory gone, disk intact.
+    _clearMapOnlyForTests();
+
+    const results = lensIds.map((id) => ({
+      lensId: id,
+      output: ok([finding("minor", { confidence: 0.8 })]),
+    }));
+    const { isError, body } = await callComplete({ reviewId, results });
+    expect(isError).toBe(false);
+    const verdict = ReviewVerdictSchema.parse(body);
+    expect(verdict.findings).toHaveLength(2);
+    expect(verdict.minor).toBe(2);
+    // Two minor findings, no blockers → computeVerdict approves.
+    expect(verdict.verdict).toBe("approve");
+    expect(verdict.hadAnyFindings).toBe(true);
+  });
+
+  it("disk write failure during the submit cycle does not turn the review into isError", async () => {
+    const { reviewId, lensIds } = await startPlanReview({
+      lensConfig: { lenses: ["security", "clean-code"] },
+    });
+    // Point the in-flight dir at a non-directory path so the next
+    // writeTask call throws. persistInFlightBestEffort runs outside
+    // the outer try/catch, so the verdict still arrives.
+    const original = process.env.LENSES_IN_FLIGHT_DIR;
+    const badPath = join(sessionDir, "not-a-dir");
+    // Create a FILE at that path so mkdirSync(badPath, recursive) fails.
+    writeFileSync(badPath, "x");
+    process.env.LENSES_IN_FLIGHT_DIR = badPath;
+    try {
+      const results = lensIds.map((id) => ({
+        lensId: id,
+        output: ok([]),
+      }));
+      const { isError, body } = await callComplete({ reviewId, results });
+      expect(isError).toBe(false);
+      const verdict = ReviewVerdictSchema.parse(body);
+      expect(verdict.verdict).toBe("approve");
+    } finally {
+      if (original === undefined) {
+        delete process.env.LENSES_IN_FLIGHT_DIR;
+      } else {
+        process.env.LENSES_IN_FLIGHT_DIR = original;
+      }
+    }
   });
 });
 

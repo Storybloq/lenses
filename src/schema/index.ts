@@ -60,3 +60,9 @@ export {
   GetPromptParamsSchema,
   type GetPromptParams,
 } from "./params.js";
+
+export {
+  LENS_ERROR_MESSAGES,
+  LensErrorCodeSchema,
+  type LensErrorCode,
+} from "./error-code.js";

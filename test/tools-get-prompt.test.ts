@@ -1,7 +1,19 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from "vitest";
 
 import { createServer } from "../src/server.js";
 import {
@@ -13,6 +25,16 @@ import {
   StartToolOutputSchema,
 } from "../src/tools/start.js";
 import { _resetForTests } from "../src/state/review-state.js";
+
+let inFlightDir: string;
+beforeAll(() => {
+  inFlightDir = mkdtempSync(join(tmpdir(), "lenses-get-prompt-if-"));
+  process.env.LENSES_IN_FLIGHT_DIR = inFlightDir;
+});
+afterAll(() => {
+  delete process.env.LENSES_IN_FLIGHT_DIR;
+  rmSync(inFlightDir, { recursive: true, force: true });
+});
 
 async function startPlan(lenses: string[]): Promise<{ reviewId: string; agentIds: string[] }> {
   const res = await handleLensReviewStart({

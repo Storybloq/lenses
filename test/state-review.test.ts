@@ -1,14 +1,30 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import type { LensId } from "../src/lenses/prompts/index.js";
 import type { LensOutput } from "../src/schema/index.js";
 import {
+  _clearMapOnlyForTests,
   _resetForTests,
   applyCompletion,
   getReview,
+  persistInFlightBestEffort,
   registerReview,
   type SubmittedResult,
 } from "../src/state/review-state.js";
+
+let inFlightDir: string;
+beforeAll(() => {
+  inFlightDir = mkdtempSync(join(tmpdir(), "lenses-state-review-if-"));
+  process.env.LENSES_IN_FLIGHT_DIR = inFlightDir;
+});
+afterAll(() => {
+  delete process.env.LENSES_IN_FLIGHT_DIR;
+  rmSync(inFlightDir, { recursive: true, force: true });
+});
 
 const RID = "11111111-1111-4111-8111-111111111111";
 // T-014: ReviewSession now carries a cross-round sessionId. Pinned to
@@ -332,6 +348,107 @@ describe("applyCompletion", () => {
  * relaxed union semantics at the unit level (plan §8b') instead of
  * relying solely on the integration coverage in tools-complete.test.
  */
+/**
+ * T-024: session is persisted to disk on registerReview. After a full
+ * Map wipe (_resetForTests clears the Map AND wipes the disk dir in
+ * THAT order), the session is gone. But with the Map alone wiped
+ * (while preserving disk state), getReview must rehydrate from disk.
+ */
+describe("T-024 disk rehydration", () => {
+  it("getReview rehydrates from disk when the Map is empty but index.json exists", () => {
+    register({
+      prompts: new Map<LensId, string>([
+        ["security", "## Safety\n\nLens: security\n"],
+        ["clean-code", "## Safety\n\nLens: clean-code\n"],
+        ["performance", "## Safety\n\nLens: performance\n"],
+      ]),
+      promptHashes: new Map<LensId, string>([
+        ["security", "h-sec"],
+        ["clean-code", "h-clean"],
+        ["performance", "h-perf"],
+      ]),
+      perLensExpiresAt: new Map<LensId, number>([
+        ["security", Date.now() + 60_000],
+        ["clean-code", Date.now() + 60_000],
+        ["performance", Date.now() + 60_000],
+      ]),
+      lensModels: new Map<LensId, "opus" | "sonnet">([
+        ["security", "opus"],
+        ["clean-code", "sonnet"],
+        ["performance", "sonnet"],
+      ]),
+    });
+
+    // Simulate a process restart: the Map is now empty but the disk
+    // dir still has index.json + prompts. Use the internal map-clear
+    // path, then read via getReview.
+    _clearMapOnlyForTests();
+
+    const s = getReview(RID);
+    expect(s).toBeDefined();
+    if (!s) throw new Error();
+    expect(s.reviewId).toBe(RID);
+    expect(s.stage).toBe("PLAN_REVIEW");
+    expect(s.expectedLensIds).toEqual(LENSES);
+    // Prompts are rehydrated from disk.
+    expect(s.prompts.get("security")).toContain("Lens: security");
+    expect(s.prompts.size).toBe(3);
+    // No terminal tasks yet → status remains "started".
+    expect(s.status).toBe("started");
+  });
+
+  it("getReview rebuilds perLensLatestOutput + perLensAttempts from terminal task records", () => {
+    register({
+      prompts: new Map<LensId, string>([
+        ["security", "prompt-sec"],
+        ["clean-code", "prompt-clean"],
+        ["performance", "prompt-perf"],
+      ]),
+      promptHashes: new Map<LensId, string>([
+        ["security", "h-sec"],
+        ["clean-code", "h-clean"],
+        ["performance", "h-perf"],
+      ]),
+      perLensExpiresAt: new Map<LensId, number>([
+        ["security", Date.now() + 60_000],
+        ["clean-code", Date.now() + 60_000],
+        ["performance", Date.now() + 60_000],
+      ]),
+      lensModels: new Map<LensId, "opus" | "sonnet">([
+        ["security", "opus"],
+        ["clean-code", "sonnet"],
+        ["performance", "sonnet"],
+      ]),
+    });
+
+    // Apply a completion and persist to disk. In the full complete.ts
+    // flow, `persistInFlightBestEffort` runs AFTER the outer try/catch
+    // closes — here we call it directly to simulate the same write path.
+    const results = [ok("security", 1), ok("clean-code", 1), ok("performance", 1)];
+    const applied = applyCompletion({
+      reviewId: RID,
+      results,
+      finalize: false,
+    });
+    if (!applied.ok) throw new Error();
+    persistInFlightBestEffort(applied.session, results);
+
+    _clearMapOnlyForTests();
+
+    const s = getReview(RID);
+    if (!s) throw new Error();
+    // All three lenses completed attempt 1 — perLensAttempts reflects it.
+    expect(s.perLensAttempts.get("security")).toBe(1);
+    expect(s.perLensAttempts.get("clean-code")).toBe(1);
+    expect(s.perLensAttempts.get("performance")).toBe(1);
+    // perLensLatestOutput has the submitted LensOutput for each.
+    expect(s.perLensLatestOutput.get("security")?.status).toBe("ok");
+    // Status is awaiting_retry because terminal tasks exist but the
+    // session wasn't finalized.
+    expect(s.status).toBe("awaiting_retry");
+  });
+});
+
 describe("applyCompletion with T-015 cachedResults", () => {
   it("providedLensIds partial but cachedLensIds covers the gap → ok", () => {
     register({

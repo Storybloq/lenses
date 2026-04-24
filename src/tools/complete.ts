@@ -31,6 +31,7 @@ import {
 } from "../schema/index.js";
 import {
   applyCompletion,
+  persistInFlightBestEffort,
   type ReviewSession,
   type SubmittedResult,
 } from "../state/review-state.js";
@@ -272,6 +273,12 @@ export async function handleLensReviewComplete(
   let session: ReviewSession;
   let safe: ReviewVerdict;
   let perLens: LensRunResult[];
+  // Hoist `submissions` so `persistInFlightBestEffort` can read them
+  // AFTER the outer try/catch closes -- mirrors the `persistRoundBestEffort`
+  // / `persistLensCacheBestEffort` pattern. A disk-write failure inside
+  // the helper cannot flip `isError: true` because the helper runs
+  // outside the try/catch.
+  const submissions: SubmittedResult[] = [];
   const agentSubmittedLensIds = new Set<LensId>();
   try {
     // First pass: classify each submitted result -- does it parse as a
@@ -280,7 +287,6 @@ export async function handleLensReviewComplete(
     // shape of each submission; applyCompletion needs the LensOutput
     // object (including syntheticError placeholders for hard-failed
     // lenses) to store the latest view.
-    const submissions: SubmittedResult[] = [];
     const parseErrors: ParseError[] = [];
     const retryCandidates: RetryCandidate[] = [];
     const maxAttempts =
@@ -425,6 +431,11 @@ export async function handleLensReviewComplete(
 
   persistRoundBestEffort(session, safe);
   persistLensCacheBestEffort(session, perLens, agentSubmittedLensIds);
+  // T-024: persist per-(reviewId, lensId, attempt) task records so a
+  // server restart between hops can rebuild `perLensLatestOutput` from
+  // disk on the next `getReview` call. Runs outside the outer try/catch
+  // so a disk failure never flips `isError: true` (RULES.md §4).
+  persistInFlightBestEffort(session, submissions);
 
   return { content: [{ type: "text", text: JSON.stringify(safe) }] };
 }

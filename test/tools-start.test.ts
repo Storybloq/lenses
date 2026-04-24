@@ -23,14 +23,25 @@ import {
 // and so parallel test files don't race on the same (lensId,
 // promptHash) keys. Per-test-file isolation — cross-test caching is
 // exercised by the dedicated T-015 integration suite, not here.
+//
+// T-024: same isolation for the in-flight persistence directory.
+// Without this, `_resetForTests`'s disk cleanup races with
+// `registerReview`'s writes across test files on the default
+// `tmpdir()/lenses-in-flight/` path, producing stderr noise and
+// occasional ENOTEMPTY rmSync failures.
 let lensCacheDir: string;
+let inFlightDir: string;
 beforeAll(() => {
   lensCacheDir = mkdtempSync(join(tmpdir(), "lenses-tools-start-lc-"));
+  inFlightDir = mkdtempSync(join(tmpdir(), "lenses-tools-start-if-"));
   process.env.LENSES_LENS_CACHE_DIR = lensCacheDir;
+  process.env.LENSES_IN_FLIGHT_DIR = inFlightDir;
 });
 afterAll(() => {
   delete process.env.LENSES_LENS_CACHE_DIR;
+  delete process.env.LENSES_IN_FLIGHT_DIR;
   rmSync(lensCacheDir, { recursive: true, force: true });
+  rmSync(inFlightDir, { recursive: true, force: true });
 });
 
 // Clear BOTH the in-memory state and the on-disk lens cache between

@@ -224,6 +224,13 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
 
   const reviewId = randomUUID();
   const sessionId = parsed.sessionId ?? randomUUID();
+  // T-024: pass lensModels so the in-flight index can record each
+  // spawned lens's model. Only spawned agents get a model entry;
+  // cached-only lenses aren't re-spawned and have no retry path.
+  const lensModels = new Map<LensId, "opus" | "sonnet">();
+  for (const agent of spawnedAgents) {
+    lensModels.set(agent.lensId, agent.model);
+  }
   registerReview({
     reviewId,
     sessionId,
@@ -235,6 +242,7 @@ function buildResponse(parsed: StartToolInput): StartToolOutput {
     promptHashes,
     prompts,
     perLensExpiresAt,
+    lensModels,
   });
 
   return {
